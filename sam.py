@@ -27,9 +27,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-question = input("Enter a Question: ")
+# question = input("Enter a Question: ")
 
-def rag(filename):
+def rag(filename, question):
     print("inside rag")
     llm = ChatOllama(model="qwen2.5-custom:latest", temperature=0)
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
@@ -125,7 +125,7 @@ def rag(filename):
     # eval_results = evaluate(dataset=dataset, metrics=metrics)  
     # print(eval_results)'''
 
-if __name__ == "__main__":
-     file_name = sys.argv[1]
-     rag(file_name)
+# if __name__ == "__main__":
+#      file_name = sys.argv[1]
+#      rag(file_name)
     
