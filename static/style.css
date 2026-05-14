@@ -1,0 +1,30 @@
+div{
+    font-family: 'Times New Roman', Times, serif;
+    font-size: 25px;
+    border: 2px solid red;
+    border-radius: 7px;
+    padding: 30px;
+}
+
+#filenameInput {
+    position: relative;
+    top: -3px;
+    padding: 5px;
+}
+
+#questionInput {
+    position: relative;
+    top: -3px;
+    padding: 5px;
+}
+
+[onclick] {
+    cursor: pointer;
+    text-decoration: underline;
+}
+
+#responseArea {
+    border: 2px solid red;
+    
+}
+
