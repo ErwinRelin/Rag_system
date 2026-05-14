@@ -1,0 +1,8 @@
+FROM qwen2.5:14b
+
+# Set the number of layers to offload to the GPU
+# Start with a lower number (like 20 or 30) and increase it if it works
+PARAMETER num_gpu 20
+
+# Optional: Adjust the context window to save memory
+PARAMETER num_ctx 4096
