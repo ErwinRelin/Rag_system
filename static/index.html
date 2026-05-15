@@ -1,54 +1,83 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>FastAPI HTML</title>
-    <link rel="stylesheet" href="/static/style.css">
+<meta charset="utf-8">
+<title>Fast Api</title>
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 
-    <h2>Ask a question about your specified file</h2>
+    <h2>Rag system</h2>
 
-    <div class="row">
-    <div class="column left"></div>
-    <div class="column middle">
-        <label for="filenameInput">Filename:</label>&nbsp;
-        <input type="text" id="filenameInput" placeholder="example.txt">
+
+  <div class="column left" style="background-color:white;">
+  </div>
+
+
+    <div class="container">
+        <div class="row1">
+            <h2>Ask a question about your specified file</h2>
+            <h4>Types of files allowed: .csv, .xls, .xlsx, .txt, .docx, .pdf</h3>
+        </div>
+
+        <div class="row2">
+            <label for="filenameInput">Filename: </label><br>
+            <p id="filenameStatement">Select a file that is specified in the above section.</p>
+            <input type="file" id="filenameInput">
+        </div>
+
+        <div class="row3">   
+            <label for="questionInput">Question</label><br>
+            <p id="questionStatement">Write a question that you want to know about the file given.</p>
+            <input type="text" id="questionInput" placeholder="ask any question.">
+        </div>
     </div>
 
-    <div class="column middle">
-        <label for="questionInput">Question:</label>&nbsp;
-        <input type="text" id="questionInput" placeholder="Enter your question here">
+    <div>
+        <button id="submitBtn" onclick="submitQuestion()">Submit</button>
     </div>
-    <div class="column right"></div>
-    <br>
+    
+    <div class="column right" style="background-color:white">
     </div>
-
-    <button onclick="submitQuestion()">Submit</button>
 
     <p id="responseArea"></p>
 
     <script>
         // 2. Fixed the function name spelling typo
         async function submitQuestion() {
-            const filename = document.getElementById('filenameInput').value;
+            const fileInput = document.getElementById('filenameInput');
             const question = document.getElementById('questionInput').value;
             const responseArea = document.getElementById('responseArea');
 
+            if (!fileInput.files || fileInput.files.length === 0) {
+                responseArea.innerText = "Please select a file first.";
+            return;
+            }
+            if (!question.trim()) {
+                responseArea.innerText = "Please enter a question.";
+            return;
+            }
+
+            const formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+            formData.append("question", question);
+
             try {
                 
+                console.log("Sending file:", fileInput.files[0].name);
+                console.log("Sending question:", question);
+
                 const response = await fetch('http://127.0.0.1:8000/ask', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ 
-                        filename: filename,
-                        question: question 
-                    }), 
+                    body: formData
+                    , 
                 });
 
                 const result = await response.json();
+                console.log("Result:", result);         
+                console.log("Answer:", result.answer);
+
+
                 if (result.error) {
                     responseArea.innerText = "error" + result.error;
                 }else {

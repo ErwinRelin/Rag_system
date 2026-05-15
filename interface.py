@@ -10,7 +10,8 @@ class RAGHandler(ABC):
         pass
 
     @abstractmethod
-    def retrieve(self, question): 
+    def retrieve(self, question: str): 
+        """Return a string of context to pass to the LLM."""
         pass
 
     @abstractmethod
