@@ -16,7 +16,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],    
     allow_headers=["*"],
@@ -27,7 +27,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 llm = ChatOllama(model="qwen2.5-custom:latest", temperature=0)
 embeddings = OllamaEmbeddings(model="nomic-embed-text:latest")
 
-UPLOAD_DIR = "tmp/rag_uploads"
+UPLOAD_DIR = r"C:\Users\Erwin\Desktop\server"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.get("/")
@@ -48,6 +48,8 @@ async def ask(
     with open(filepath, "wb") as f:
         shutil.copyfileobj(file.file, f)
     handler = RAGHandlerFactory.get_handler(filepath, llm, embeddings)
+    print(handler)
     handler.load(filepath)
     response = handler.answer(question)
+    print(response)
     return {"answer": response}
