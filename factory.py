@@ -1,6 +1,7 @@
 from interface import RAGHandler
 from documentrag import DocumentRAGHandler
 from tabularrag import TabularRAGHandler
+import os
 
 class RAGHandlerFactory:
     TABULAR_EXTENSIONS = {'.csv', '.xlsx', '.xls'}
@@ -8,7 +9,7 @@ class RAGHandlerFactory:
 
     @staticmethod
     def get_handler(filepath, llm, embeddings) -> RAGHandler:
-        ext = '.' + filepath.rsplit('.', 1)[-1].lower()
+        ext = os.path.splitext(filepath)[-1].lower()
         if ext in RAGHandlerFactory.TABULAR_EXTENSIONS:
             return TabularRAGHandler(llm, embeddings)
         elif ext in RAGHandlerFactory.DOCUMENT_EXTENSIONS:
