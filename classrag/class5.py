@@ -9,18 +9,24 @@ from operator import itemgetter
 from unstructured.partition.auto import partition
 from unstructured.chunking.title import chunk_by_title
 from langchain_experimental.open_clip import OpenCLIPEmbeddings
+from langchain_core.runnables import RunnablePassthrough
 from langchain_chroma import Chroma
 import chromadb
 import uuid
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import ChatOllama
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from deep_translator import GoogleTranslator
 
 # llm1 = ChatOllama(model="qwen2.5-custom:latest", temperture = 0)
 llm2 = ChatOllama(model="qwen2.5vl:7custom", temperature = 0)
 
+all_results = []
+
 chroma_client = chromadb.Client()
 embedding_fn = OpenCLIPEmbeddings()
+text_embedding_fn = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 collection = Chroma(
     collection_name="my_chunk",
@@ -31,13 +37,12 @@ collection = Chroma(
 folder_path = Path(r"C:\Users\Erwin\Desktop\rag_system\classrag\screen\Real Estate Property Management")
 
 # Read the excel file
-df = pd.read_excel('screen\Real Estate Property Management\excel5.xls')
+df = pd.read_excel('screen\Real Estate Property Management\issues1.xlsx')
+
 
 # Get column names as a list
 screen_names = df['Screen Name'].unique()
 
-def combined_query(inputs):
-    return inputs["issue_description"] + " " + inputs["expected_result"]
 
 for screen_name in screen_names:
     screen_folder = folder_path / screen_name
@@ -60,15 +65,14 @@ for screen_name in screen_names:
             strategy="auto",
             extract_images_in_pdf=True,
             extract_image_block_types=["Image", "Table"],
-            extract_image_block_output_dir=output_dir,
             extract_image_block_to_payload=True,
         )
 
         chunks = chunk_by_title(
             elements,
-            max_characters=1200,
-            combine_text_under_n_chars=600,
-            overlap=200,
+            max_characters=1500,
+            combine_text_under_n_chars=700,
+            overlap=300,
             multipage_sections = False
         )
 
@@ -110,17 +114,57 @@ for screen_name in screen_names:
                 except OSError:
                     pass
 
-    # ✅ NOW query — once per issue row for this screen name
-    retriever = collection.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-
     matched_rows = df[df['Screen Name'] == screen_name]
     for _, row in matched_rows.iterrows():
         issue_description = row['Issue Description']
-        expected_result = row['Expected Result']
+        expected_result = row['Expected Outcome']
 
         print(f"screen_name: {screen_name}")
         print(f"issue_description: {issue_description}")
         print(f"expected_result: {expected_result}")
+
+        def make_context_fn(retriever, embedding_fn):
+            def context_from_inputs(inputs) -> str:
+                if isinstance(inputs, dict):
+                    query = inputs.get("issue_description", "") + " " + inputs.get("expected_result", "")
+                else:
+                    query = str(inputs)
+
+                # OpenCLIP wraps text embeddings in an extra list — unwrap it
+                raw = embedding_fn.embed_query(query)
+                if isinstance(raw[0], list):
+                    query_embedding = raw[0]   # unwrap one level [[...]] -> [...]
+                else:
+                    query_embedding = raw      # already flat [...]
+
+                docs = retriever.vectorstore.similarity_search_by_vector(
+                    query_embedding, k=5
+                )
+                return "\n\n".join(d.page_content for d in docs)
+            return context_from_inputs
+
+        retriever = collection.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+        context_from_inputs = make_context_fn(retriever, embedding_fn)
+
+        prompt = """You are a technical writer. Using ONLY the BRD context below, rewrite the issue description into a single clear, specific sentence that identifies the exact component, the broken behavior, and the expected behavior.
+
+        Context: {context}
+        Issue Description: {issue_description}
+        Expected Outcome: {expected_result}
+
+        Output one sentence only. No headings, no bullet points, no explanation.
+        """
+
+        enrichment_chain = (
+            {
+                "context": context_from_inputs,
+                "issue_description": itemgetter("issue_description"),
+                "expected_result": itemgetter("expected_result"),  # also passed to prompt
+            }
+            | ChatPromptTemplate.from_template(prompt)
+            | llm2
+            | StrOutputParser()
+        )
 
         template = """
         You are a precise assistant. Answer ONLY using the context below. 
@@ -137,8 +181,7 @@ for screen_name in screen_names:
 
         Given:
         - context from the documents: {context}
-        - Issue description: {issue_description}
-        - Expected result: {expected_result}
+        - Issue description: {enriched_issue}
         """
 
         def parse_result(text: str) -> dict:
@@ -151,18 +194,36 @@ for screen_name in screen_names:
             return {"category": category, "reason": lines.get("Reason", "")}
 
         chain = (
-            {"context": combined_query | retriever,
-             "issue_description": itemgetter("issue_description"),
-             "expected_result": itemgetter("expected_result")}
+            {"context": context_from_inputs,
+             "enriched_issue": RunnablePassthrough()}
             | ChatPromptTemplate.from_template(template)
             | llm2
             | StrOutputParser()
             | parse_result
         )
 
-        result = chain.invoke({
+        enriched_issue = enrichment_chain.invoke({
             "issue_description": issue_description,
-            "expected_result": expected_result
+            "expected_result": expected_result,
         })
-        print(f"google: {result}\n")
+
+        print(f"enriched_issue: {enriched_issue}")
+        transalated_issue = GoogleTranslator(source='auto', target='ta').translate(enriched_issue)
+
+        result = chain.invoke(enriched_issue)
+
+        print(f"result: {result}\n")
+
+        all_results.append({
+            "Enriched Issue": enriched_issue,
+            "Tamil Issue": transalated_issue,
+            "Classification": result["category"],
+            "Reason": result["reason"],
+        })
+
+final_df = pd.DataFrame(all_results)
+
+with pd.ExcelWriter('screen\Real Estate Property Management\issues1.xlsx', engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    start_column = writer.sheets["sheet1"].max_column
+    final_df.to_excel(writer, sheet_name="sheet1", startcol=start_column, header=True, index=False)
 
