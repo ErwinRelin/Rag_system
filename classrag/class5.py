@@ -223,7 +223,7 @@ for screen_name in screen_names:
 
 final_df = pd.DataFrame(all_results)
 
-with pd.ExcelWriter('screen\Real Estate Property Management\issues1.xlsx', engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+with pd.ExcelWriter('screen\Real Estate Property Management\issues1.xlsx', engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
     start_column = writer.sheets["sheet1"].max_column
     final_df.to_excel(writer, sheet_name="sheet1", startcol=start_column, header=True, index=False)
 
