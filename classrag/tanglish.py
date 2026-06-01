@@ -1,7 +1,13 @@
 import ollama
 import re
 from keybert import KeyBERT
+import spacy
+import pytextrank
 
+nlp = spacy.load("en_core_web_md")
+
+if "textrank" not in nlp.pipe_names:
+    nlp.add_pipe("textrank")
 # ─────────────────────────────────────────────
 # 1. MODE DETECTION
 # ─────────────────────────────────────────────
@@ -27,6 +33,9 @@ def detect_sentence_mode(english_text):
         "still active",      
         "not invalidated",    
         "not terminated",
+        "lacks",
+        "fails to",
+        "does not",
     ]
 
     if any(kw in text_lower for kw in expected_keywords):
@@ -58,7 +67,18 @@ MODE_INSTRUCTION = {
         "Use 'pannudu' to show the wrong action is actively happening."
     ),
     "neutral": (
-        "This is a factual statement. Translate naturally using pannudu or aagudu."
+        """This is a factual defect statement.
+
+        Use:
+
+        missing → missing-aa irukku
+        lacks → illa / missing-aa irukku
+        fails to → aagala
+        does not → aagala
+        after clicking → click pannina appuram
+
+        Prefer natural spoken Tanglish grammar.
+        Avoid literal English grammar ordering."""
     ),
 }
 
@@ -75,6 +95,12 @@ Tanglish : Handler configured retry policy-a follow pannanum
 
 English  : Payment submission should enforce defined payment constraints
 Tanglish : Payment submission defined payment constraints-a enforce pannanum
+
+English : UI components should maintain alignment and readability across supported display and zoom configurations
+Tanglish : Supported display-um zoom configurations-um la UI components alignment-um readability-um maintain aaganum
+
+English : The API should maintain consistent response structures regardless of optional input availability
+Tanglish : Optional input irundhaalum illaatiyum API consistent response structure-a maintain pannanum
 """,
 
     "bug": """
@@ -120,25 +146,370 @@ Tanglish : Restart aana appuram background job existing configuration-a overwrit
 
 English  : The scheduler follows the configured retry limit
 Tanglish : Scheduler configured retry limit-a follow pannudu
+
+English : The login button lacks a functional aria-label attribute
+Tanglish : Login button-ku functional aria-label attribute missing-aa irukku
+
+English : The button fails to redirect the user after clicking
+Tanglish : Click pannina appuram button user-a redirect aagala
+
+English : The field lacks configured validation rules
+Tanglish : Field-ku configured validation rules illa
 """,
 }
 
-def add_square_brackets():
-    kw_model = KeyBERT()
-    doc = "KeyBERT is a minimal and easy-to-use keyword extraction technique."
+PROTECTED_TERMS = [
 
-    weighted_keywords = kw_model.extract_keywords(doc)
+# AUTH
+"OAuth2",
+"JWT",
+"MFA",
+"OTP",
+"CSPRNG",
 
-    # 2. Extract only the keywords
-    keywords = [kw[0] for kw in weighted_keywords]
+"Persistent_Refresh_Token",
+"access token",
+"refresh token",
+"token rotation",
+"token blocklist",
+"token lifecycle",
+"session persistence",
+"session timeout",
+"session validation",
 
-    # Loop through each keyword and replace it with a modified version
-    for kw in keywords:
-        # \b ensures we only match whole words/phrases, flags=re.IGNORECASE ignores capitalization
-        pattern = re.compile(rf'\b{re.escape(kw)}\b', flags=re.IGNORECASE)
-        doc = pattern.sub(f"[{kw}]", doc)
+"HttpOnly cookie",
+"SameSite=Strict",
+"SHA-256",
+"Redis",
 
-    return doc
+"Remember Me",
+"new IP detection",
+"security notice",
+"security alert email",
+
+"credential complexity",
+"social sign-in",
+"Google",
+"Microsoft",
+
+"GDPR",
+"CCPA",
+"SOC 2",
+
+
+# PAYMENTS
+"Stripe",
+"Plaid",
+"ACH",
+"Credit Card",
+"Debit Card",
+
+"Idempotency Key",
+"UUID",
+
+"payment_intent.succeeded",
+"payment_intent.payment_failed",
+"payment_intent.processing",
+
+"POST /api/v1/payments/initiate",
+
+"gateway integration",
+"payment method",
+"payment orchestration",
+"partial payment",
+
+"Service Fee",
+"processing fee",
+"ledger mapping",
+"Charge_ID",
+
+"Rent",
+"Utility",
+"Late Fee",
+
+"bank reconciliation",
+"QuickBooks sync",
+"NSF late fee",
+
+"PaymentMethod API",
+"link_token",
+
+
+# DATABASE
+"Tenant_Transactions",
+"Property settings table",
+
+"General_Ledger",
+"Tax_Ledger",
+"Financial_Summary_View",
+
+"Persistent_Tokens",
+
+"Maintenance_Request",
+"Property_Listings",
+
+"GL_Entries",
+
+"user_id",
+"property_id",
+"fiscal_year",
+
+"Issued_IP",
+"Charge_ID",
+
+# API_ENDPOINTS
+"POST /api/auth/refresh",
+"POST /api/v1/payments/initiate",
+"POST /api/v1/work-orders",
+
+"DELETE /v1/payment_methods/:id",
+
+"/login",
+
+"QuickBooks Online API v3",
+"Zillow Partner API",
+"HotPads Feed API",
+"Apartments.com API",
+"DocuSign API",
+"Twilio API",
+
+# CLOUD
+"S3",
+"IndexedDB",
+
+"Lambda pipeline",
+"CRON Job",
+
+"OAuth authentication",
+
+"encrypted storage",
+"AES-256 encryption",
+
+"webhook verification",
+"secure archival",
+
+"client-side compression",
+"pre-signed URL",
+
+"offline synchronization",
+"local caching",
+"batch synchronization",
+
+# LISTINGS
+"Hard-Mandatory",
+"Soft-Mandatory",
+
+"422 Unprocessable Entity",
+
+"Draft",
+"Ready",
+"Published",
+"Paused",
+"Leased",
+"Archived",
+
+"ZIP+4",
+"USPS ZIP validation",
+
+"Current_Year",
+
+"EXIF metadata",
+
+"syndication",
+"listing rejection",
+
+"Monthly_Rent",
+"Bedrooms",
+"Bathrooms",
+"Square_Footage",
+
+"Pet_Policy",
+"Available_Date"
+
+# MAINTENANCE
+"work order",
+"maintenance request",
+"media upload",
+
+"SMS escalation",
+"urgency level",
+
+"Emergency",
+"High",
+"Standard",
+"Low",
+
+"Water Leak",
+"Gas Smell",
+
+"Twilio SMS alerts",
+
+"SLA monitoring",
+"state machine",
+
+"contractor assignment",
+"tenant sign-off",
+
+"GPS validation",
+"digital signature collection",
+
+"proof of service",
+"offline job caching",
+
+"assignment visibility",
+"work order prioritization",
+
+"Vendor_ID",
+"repair evidence",
+
+"Base64 Encoded String",
+
+# ACCOUNTING
+"NOI",
+"GOI",
+"Vacancy_Loss",
+"Operating_Expenses",
+
+"General_Ledger",
+"Tax_Ledger",
+
+"Net Operating Income",
+
+"QuickBooks Online Ledger",
+"Financial Ledger",
+
+"transaction mapping",
+"reconciliation monitoring",
+
+"audit trail",
+"audit readiness",
+
+"tax liability",
+"expense benchmarking",
+
+"Debt Service Coverage Ratio",
+
+"Income",
+"Expense",
+
+"estimated_tax",
+"actual_tax",
+
+# LEASE
+"DocuSign integration",
+"embedded signing workflow",
+
+"counter-signature",
+"document completion verification",
+
+"secure document delivery",
+
+"audit logging",
+
+"signing ceremony",
+
+"completed PDF retrieval",
+
+"identity verification",
+
+"tamper-proof storage",
+
+"paperless execution",
+
+# ROLES
+"Tenant",
+"Owner",
+"Manager",
+"Admin",
+"Contractor",
+
+"Portfolio Manager",
+"Finance Administrator",
+
+"Property Manager",
+
+"Security Officer",
+
+"QA Lead",
+"Engineering Lead",
+
+"Product Owner",
+
+# VALIDATION_ERRORS
+"HTTP 500",
+"422 Unprocessable Entity",
+
+"validation error",
+
+"duplicate submission",
+
+"connection failure",
+
+"integration instability",
+
+"failed upload",
+
+"API rejection",
+
+"unsupported platform",
+
+"unsupported version",
+
+"null value",
+
+"incomplete metadata",
+
+"missing required fields",
+
+"security violation"
+]
+
+def add_square_brackets(text):
+
+    output = text
+
+    # ---------- BRD TERMS ----------
+
+    terms = sorted(
+        PROTECTED_TERMS,
+        key=len,
+        reverse=True
+    )
+
+    for term in terms:
+
+        pattern = re.compile(
+            rf'(?<!\[)\b{re.escape(term)}\b(?!\])',
+            flags=re.IGNORECASE
+        )
+
+        output = pattern.sub(
+            f"[{term}]",
+            output
+        )
+
+    # ---------- TEXTRANK ----------
+
+    doc = nlp(output)
+
+    for phrase in doc._.phrases[:5]:
+
+        phrase_text = phrase.text.strip()
+
+        if len(phrase_text.split()) < 3:
+            continue
+
+        pattern = re.compile(
+            rf'(?<!\[)\b{re.escape(phrase_text)}\b(?!\])',
+            flags=re.IGNORECASE
+        )
+
+        output = pattern.sub(
+            f"[{phrase_text}]",
+            output
+        )
+
+    return output
 # ─────────────────────────────────────────────
 # 3. SENTENCE SPLITTER  (protects [] blocks)
 # ─────────────────────────────────────────────
@@ -163,7 +534,7 @@ def split_sentence(text):
     parts = re.split(r',\s*but\s*', safe, maxsplit=1)
     has_but = len(parts) > 1
 
-    before_but = re.split(r',\s*(?:and\s*)?|\band\b\s*', parts[0])
+    before_but = [parts[0]]
     after_but  = re.split(r',\s*(?:and\s*)?|\band\b\s*', parts[1]) if has_but else []
 
     chunks = (
@@ -188,31 +559,37 @@ def split_sentence(text):
 def tanglish_chunk(english_chunk, mode="neutral"):
     prompt = f"""You are a Tanglish transliterator. Tanglish = Tamil grammar written in English letters (Latin alphabet only, never Tamil script).
 
-CONTEXT: {MODE_INSTRUCTION[mode]}
+    CONTEXT: {MODE_INSTRUCTION[mode]}
 
-EXAMPLES:
-{MODE_EXAMPLES[mode]}
+    EXAMPLES:
+    {MODE_EXAMPLES[mode]}
 
-STRICT RULES:
-- Translate ONLY the given phrase — do NOT add explanations, suggestions, or extra sentences
-- ONE line output only — no second sentence, no period mid-output
-- "should" / "must"        → pannanum or aaganum (NEVER pannunga, NEVER aaru)
-- "overwrites"             → overwrite pannudu  (present wrong action, never in brackets)
-- "follow" + should        → follow pannanum     (ONE verb, never "pannanum follow aaganum")
-- "indefinitely"           → endha neramum ... aagudu  (ongoing, never aagala)
-- Words inside [] stay EXACTLY as written, brackets included — do NOT invent new brackets
-- Keep as English: button, spinner, checkout, coupon, amount, price, discount, sync, priority, config, scheduler
-- Do NOT start output with "aana", "and", or "but"
-- Output ONLY the Tanglish phrase. One line. No explanation.
-- For "X instead of Y" sentences: always say the correct behaviour first, 
-  then the wrong behaviour.
-  Pattern: "[correct thing]-a display pannanum, aana [wrong thing]-a display pannudu
+    STRICT RULES:
+    - Output ONE Tanglish line only.
+    - Keep [] text EXACTLY unchanged.
+    - Preserve all technical clauses; do not omit information.
+    - Maintain polarity:
+        positive → pannudhu / aagudhu
+        negative ("fails to","does not","missing") → pannala / aagala / missing-aa irukku
+    - "should"/"must" → pannanum or aaganum
+    - "after clicking"/"upon clicking" → click pannina appuram
+    - Keep technical words in English.
+    - Do not add explanations or extra text.
 
-English phrase: {english_chunk}
-Tanglish:"""
+    Example:
+
+    English:
+    Field displays raw ID instead of configured label
+
+    Tanglish:
+    Configured label-a display pannanum,
+    aana raw ID-a display pannudu
+
+    English phrase: {english_chunk}
+    Tanglish:"""
 
     response = ollama.chat(
-        model="tanglish-gemma:latest",
+        model="translategemma_custom:latest",
         messages=[{"role": "user", "content": prompt}],
         options={"temperature": 0},
     )
@@ -231,14 +608,61 @@ def clean_chunk(text):
     ).strip()
     return text
 
+def normalize_patterns(text):
 
+    replacements = {
+
+        r'\blacks\b': 'is missing',
+
+         r'\blacks\b':'is missing',
+
+        r'\bfails to\b':'does not',
+
+        r'\bdoes not\b':'does not',
+
+        r'\bupon clicking\b':'after clicking',
+
+        r'\bwhen clicked\b':'after clicking',
+
+        r'\bon click\b':'after clicking',
+
+        r'\bafter login\b':'login aana appuram',
+    }
+
+    for pattern, repl in replacements.items():
+        text = re.sub(pattern, repl, text, flags=re.I)
+
+    return text
 # ─────────────────────────────────────────────
 # 6. MAIN PIPELINE
 # ─────────────────────────────────────────────
+def should_chunk(text):
+
+    # very long sentence
+    if len(text) > 150:
+        return True
+
+    # multiple clauses / heavy complexity
+    complex_markers = [
+        ";", "whereas", "while", "however",
+        "regardless of", "provided that",
+        "depending on"
+    ]
+
+    if any(m in text.lower() for m in complex_markers):
+        return True
+
+    return False
+
 
 def english_to_tanglish(english_text, verbose=True):
+    english_text = normalize_patterns(english_text)
+    # english_text = add_square_brackets(english_text)
     mode = detect_sentence_mode(english_text)
-    chunks = split_sentence(english_text)
+    if should_chunk(english_text):
+        chunks = split_sentence(english_text)
+    else:
+        chunks = [(english_text, False)]
 
     if verbose:
         print(f"  → Mode detected : {mode}")
@@ -249,7 +673,7 @@ def english_to_tanglish(english_text, verbose=True):
     tanglish_parts = []
     for chunk, is_after_but in chunks:
         
-        raw     = tanglish_chunk(chunk, mode=mode)
+        raw = tanglish_chunk(chunk, mode=mode)
         cleaned = clean_chunk(raw)
         if verbose:
             print(f"  → Chunk tanglish: {cleaned}")
@@ -274,12 +698,12 @@ def english_to_tanglish(english_text, verbose=True):
 
 if __name__ == "__main__":
     test_sentences = [
-        "Users intermittently receive a successful login confirmation, but the dashboard fails to load completely.",
-        "Successful authentication should consistently redirect users to a fully rendered dashboard without missing components.",
-        "The customer profile API returns incomplete address details when optional fields are omitted during account creation.",
-        "The API should maintain consistent response structures regardless of optional input availability.",
-        "Action buttons overlap with form labels when browser zoom exceeds standard display scaling.",
-        "UI components should maintain alignment and readability across supported display and zoom configurations."
+        "Offline contractor update overwrites higher priority assignment changes after reconnection, conflicting with configured synchronization priority.",
+        "The system fails to enforce the defined Charge_ID allocation priority for partial payments, leading to incorrect distribution of payments.",
+        "The Year_Built validation rule incorrectly displays a Studio unit value as numeric zero instead of the configured 'Studio' label.",
+        "The mobile action footer overlaps the progress section on smaller screens, causing the layout to be unreadable across supported devices.",
+        "The MFA screen displays inconsistent masked delivery destination formatting, and the expected outcome is for verification details to follow the configured display formatting.",
+        "The MFA verification endpoint POST /api/auth/mfa/verify returns a 403 Account locked response when the account is suspended, failing to align with the expected behavior of returning a 401 Unauthorized response."
     ]
 
     for sentence in test_sentences:
