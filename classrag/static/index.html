@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fast Api</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <h2>Rag system</h2>
+
+  <div class="column left" style="background-color:white;">
+  </div>
+
+
+    <div class="container">
+        <div class="row1">
+            <h2>Give a issue or a text from the document that you want to enrich and translate.</h2>
+        </div>
+
+        <div class="row2">
+            <label for="filenameInput">Filename: </label><br>
+            <p id="filenameStatement">Select a file that is specified in the above section.</p>
+            <input type="file" id="filenameInput">
+        </div>
+
+        <div class="row3">   
+            <label for="questionInput">Question: </label><br>
+            <p id="questionStatement">Ask anything that you want to know about the document.</p>
+            <input type="text" id="questionInput" placeholder="ask any question."><br>
+            <button type="submit" id="submitBtn">submit</button>
+        </div>
+
+        <div class="row4">
+            <h3 id="answer4">Answer: </h3>
+            <div id="loader"></div> 
+            <p id="responseArea"></p>
+        </div>
+
+        
+    </div>
+
+    
+
+    
+    <div class="column right" style="background-color:white">
+    </div>
+
+    
+
+    <script>
+    const submitBtn = document.querySelector("#submitBtn");
+    submitBtn.addEventListener("click", submitQuestion);
+
+    async function submitQuestion(event) {
+        event.preventDefault();
+        
+        // 1. Properly target your HTML elements
+        const fileInput = document.getElementById('filenameInput');
+        const question = document.getElementById('questionInput').value;
+        const responseArea = document.getElementById('responseArea');
+        const btn = document.getElementById('submitBtn');
+        const loader = document.getElementById('loader');
+
+        // 2. Clear previous responses and show the loader
+        responseArea.innerText = "";
+        btn.disabled = true;
+        loader.style.display = "block";
+
+        // Validation checks
+        if (!fileInput.files || fileInput.files.length === 0) {
+            responseArea.innerText = "Please select a file first.";
+            btn.disabled = false;
+            loader.style.display = "none";
+            return;
+        }
+        if (!question.trim()) {
+            responseArea.innerText = "Please enter a question.";
+            btn.disabled = false;
+            loader.style.display = "none";
+            return;
+        }
+
+        const formData = new FormData();
+        formData.append("file", fileInput.files[0]);
+        formData.append("question", question);
+
+        try {
+            console.log("Sending file:", fileInput.files[0].name);
+            console.log("Sending question:", question);
+            
+            const response = await fetch('http://127.0.0.1:8000/ask', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.detail || `Server responded with status ${response.status}`);
+            }
+
+            const result = await response.json();
+            console.log("Result:", result);
+
+            if (result.error) {
+                responseArea.innerText = "error " + result.error;
+            } else {
+                `Enriched Issue: "${result.answer}"\n\nTanglish: "${result.tanglish}"`;
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            responseArea.innerText = "Error sending question.";
+        } finally {
+            btn.disabled = false;
+            loader.style.display = "none";
+        }
+    }
+</script>
+
+</body>
+</html>
