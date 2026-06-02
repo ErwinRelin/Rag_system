@@ -64,15 +64,15 @@ MODE_INSTRUCTION = {
     ),
     "bug_subtle": (
         "This is a SUBTLE BUG — the system IS doing something it should NOT do. "
-        "Use 'pannudu' to show the wrong action is actively happening."
+        "Use 'pannudthu' to show the wrong action is actively happening."
     ),
     "neutral": (
         """This is a factual defect statement.
 
         Use:
 
-        missing → missing-aa irukku
-        lacks → illa / missing-aa irukku
+        missing → missing-aa irukkudthu
+        lacks → illa / missing-aa irukkudthu
         fails to → aagala
         does not → aagala
         after clicking → click pannina appuram
@@ -119,39 +119,39 @@ Tanglish : submit button gray-out aayiduchu
 
     "bug_subtle": """
 English  : The form accepts negative values outside the valid range
-Tanglish : Form valid range-ku veliye negative values-a accept pannudu
+Tanglish : Form valid range-ku veliye negative values-a accept pannudthu
 
 English  : The filter ignores the configured date constraints
-Tanglish : Filter configured date constraints-a ignore pannudu
+Tanglish : Filter configured date constraints-a ignore pannudthu
 
 "English  : User session remains active after password reset\n"
 "Tanglish : Password reset aana appuram user session active-aa irukkudhu, terminate aaganum\n"
 
 "English  : The field displays raw ID instead of the configured label\n"
-"Tanglish : Field configured label-a display pannanum, aana raw ID-a display pannudu\n"
+"Tanglish : Field configured label-a display pannanum, aana raw ID-a display pannudthu\n"
 
 English  : The scheduler skips locked records during sync
-Tanglish : Scheduler sync-la locked records-a skip pannudu
+Tanglish : Scheduler sync-la locked records-a skip pannudthu
 
 English  : Offline update overwrites higher priority changes after reconnection
-Tanglish : Reconnect aana appuram offline update higher priority changes-a overwrite pannudu
+Tanglish : Reconnect aana appuram offline update higher priority changes-a overwrite pannudthu
 """,
 
     "neutral": """
 English  : The sync process skips deleted records after reconnection
-Tanglish : Reconnect aana appuram sync process deleted records-a skip pannudu
+Tanglish : Reconnect aana appuram sync process deleted records-a skip pannudthu
 
 English  : Background job overwrites the existing configuration on restart
-Tanglish : Restart aana appuram background job existing configuration-a overwrite pannudu
+Tanglish : Restart aana appuram background job existing configuration-a overwrite pannudthu
 
 English  : The scheduler follows the configured retry limit
-Tanglish : Scheduler configured retry limit-a follow pannudu
+Tanglish : Scheduler configured retry limit-a follow pannudthu
 
 English : The login button lacks a functional aria-label attribute
-Tanglish : Login button-ku functional aria-label attribute missing-aa irukku
+Tanglish : Login button-ku functional aria-label attribute missing-aa irukkudthu
 
 English : The button fails to redirect the user after clicking
-Tanglish : Click pannina appuram button user-a redirect aagala
+Tanglish : Click pannadthuku appuram button user-a redirect aagala
 
 English : The field lacks configured validation rules
 Tanglish : Field-ku configured validation rules illa
@@ -570,7 +570,7 @@ def tanglish_chunk(english_chunk, mode="neutral"):
     - Preserve all technical clauses; do not omit information.
     - Maintain polarity:
         positive → pannudhu / aagudhu
-        negative ("fails to","does not","missing") → pannala / aagala / missing-aa irukku
+        negative ("fails to","does not","missing") → pannala / aagala / missing-aa irukkudthu
     - "should"/"must" → pannanum or aaganum
     - "after clicking"/"upon clicking" → click pannina appuram
     - Keep technical words in English.
@@ -583,13 +583,13 @@ def tanglish_chunk(english_chunk, mode="neutral"):
 
     Tanglish:
     Configured label-a display pannanum,
-    aana raw ID-a display pannudu
+    aana raw ID-a display pannudthu
 
     English phrase: {english_chunk}
     Tanglish:"""
 
     response = ollama.chat(
-        model="translategemma_custom:latest",
+        model="transalategemma_custom:latest",
         messages=[{"role": "user", "content": prompt}],
         options={"temperature": 0},
     )
