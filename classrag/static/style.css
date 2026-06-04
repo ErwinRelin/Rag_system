@@ -1,182 +1,224 @@
+:root {
+  --font: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --bg: #f7f7f5;
+  --surface: #ffffff;
+  --border: rgba(0, 0, 0, 0.1);
+  --border-hover: rgba(0, 0, 0, 0.25);
+  --text-primary: #1a1a1a;
+  --text-secondary: #6b6b6b;
+  --text-hint: #a0a0a0;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --green-bg: #EAF3DE;
+  --green-text: #27500A;
+  --purple-bg: #EEEDFE;
+  --purple-text: #3C3489;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
 body {
-  background-image: url("images/web_back1.avif");
-  background-repeat: no-repeat;
-  background-size: cover;
-  background-position: center;
+  background-color: var(--bg);
+  font-family: var(--font);
+  color: var(--text-primary);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px 16px 60px;
+}
+
+h2 {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  color: var(--text-primary);
+  margin-bottom: 24px;
+  align-self: flex-start;
+  max-width: 660px;
+  width: 100%;
+}
+
+.column {
+  display: none;
 }
 
 .container {
-  display: grid;
-  grid-template-rows: repeat(3, 200px); 
-  grid-template-columns: 75vh;        
-  justify-content: center;              
-  gap: 10px;
+  width: 100%;
+  max-width: 660px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.row1 {
-    color: white;
-    height: 130px;
-    margin-top:-40px;
-    backdrop-filter: blur(8px) saturate(117%);
-    -webkit-backdrop-filter: blur(8px) saturate(117%);
-    background-color: rgba(17, 25, 40, 0.61);
-    border-radius: 12px;
-    border: 1px solid rgba(255, 255, 255, 0.125);
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-}
-
-.row2 {
-    border-radius: 10px;    
-    height: 200px;
-    margin-top:-110px;
-    backdrop-filter: blur(8px) saturate(117%);
-    -webkit-backdrop-filter: blur(8px) saturate(117%);
-    background-color: rgba(17, 25, 40, 0.61);
-    border-radius: 12px;
-    border: 1px solid rgba(255, 255, 255, 0.125);
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-}
-
-.row3 {
-    color: white;
-    border-radius: 10px;
-    height: 217px;
-    margin-top:-110px;
-    backdrop-filter: blur(8px) saturate(117%);
-    -webkit-backdrop-filter: blur(8px) saturate(117%);
-    background-color: rgba(17, 25, 40, 0.61);
-    border-radius: 12px;
-    border: 1px solid rgba(255, 255, 255, 0.125);
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-}
-
+.row1,
+.row2,
+.row3,
 .row4 {
-    color: white;
-    margin-top: -90px;
-    backdrop-filter: blur(8px) saturate(117%);
-    -webkit-backdrop-filter: blur(8px) saturate(117%);
-    background-color: rgba(17, 25, 40, 0.61);
-    border-radius: 12px;
-    border: 1px solid rgba(255, 255, 255, 0.125);
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  background: var(--surface);
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px 22px;
+  font-family: var(--font);
 }
 
-
-label[for="filenameInput"] {
-    color: black;
-    display: inline-block;
-    margin-left: 20px;
-    margin-top: 25px;
-    font-size: 20px;
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-    font-weight: 500;
-    color: white;
+/* row1 — intro text */
+.row1 h2 {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: 1.6;
+  letter-spacing: 0;
 }
 
-label[for="questionInput"] {
-    display: inline-block;
-    margin-left: 20px;
-    margin-top: 20px;
-    font-size: 20px;
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-    font-weight: 500;
-    color: white;
-}
-
-#filenameInput {
-    margin-left: 20px;
-    margin-top: 25px;
-    backdrop-filter: blur(8px) saturate(117%);
-    -webkit-backdrop-filter: blur(8px) saturate(117%);
-    background-color: rgb(250, 252, 255);
-    border-radius: 5px;
-    border: 4px solid rgba(255, 255, 255, 0.125);
+/* row2 — file upload */
+.row2 label[for="filenameInput"] {
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  display: block;
+  margin-bottom: 8px;
 }
 
 #filenameStatement {
-    color: white;
+  font-size: 13px;
+  color: var(--text-hint);
+  margin-bottom: 12px;
+  font-style: italic;
+}
+
+#filenameInput {
+  font-size: 13px;
+  font-family: var(--font);
+  color: var(--text-primary);
+  border: 1.5px dashed var(--border-hover);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  width: 100%;
+  background: var(--bg);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+#filenameInput:hover {
+  border-color: var(--text-secondary);
+  background: var(--surface);
+}
+
+/* row3 — question input */
+.row3 label[for="questionInput"] {
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  display: block;
+  margin-bottom: 8px;
+}
+
+#questionStatement {
+  font-size: 13px;
+  color: var(--text-hint);
+  margin-bottom: 12px;
+  font-style: italic;
 }
 
 #questionInput {
-    margin-left: 20px;
-    margin-top: 17px;
-    font-size: 20px;
-    border: none;
- border-radius: 15px;
- padding: 15px;
- background-color: #ccb7b7;
- font-size: medium;
- font-weight: bold;
- max-width: 200px;
+  width: 100%;
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  font-size: 14px;
+  font-family: var(--font);
+  color: var(--text-primary);
+  background: var(--surface);
+  outline: none;
+  transition: border-color 0.15s;
+  margin-bottom: 14px;
+}
+
+#questionInput:focus {
+  border-color: var(--border-hover);
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.05);
+}
+
+#questionInput::placeholder {
+  color: var(--text-hint);
 }
 
 #submitBtn {
-    margin-left: 24px;
-    margin-top: 15px;
-    background-color: #04AA6D; /* Green */
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--text-primary);
+  color: var(--surface);
   border: none;
-  color: white;
-  padding: 6px 14px;
-  text-align: center;
-  text-decoration: none;
-  display: inline-block;
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  padding: 9px 20px;
+  font-size: 14px;
+  font-weight: 500;
+  font-family: var(--font);
   cursor: pointer;
-  border-radius: 4px;
+  transition: opacity 0.15s;
 }
 
+#submitBtn:hover {
+  opacity: 0.8;
+}
 
+#submitBtn:active {
+  opacity: 0.65;
+  transform: scale(0.98);
+}
 
+#submitBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* row4 — answer */
 #answer4 {
-    margin-left: 20px;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
 }
-
-#responseArea {
-    margin-left: 20px;
-}
-
-
 
 #loader {
-    display: none;
-    margin-left: 20px;
-  border: 8px solid #f3f3f3; /* Light grey */
-  border-top: 8px solid #3498db; /* Blue */
+  display: none;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--text-primary);
   border-radius: 50%;
-  width: 20px;
-  height: 20px;
-  animation: spin 2s linear infinite;
+  animation: spin 0.7s linear infinite;
+  margin-bottom: 12px;
 }
 
 @keyframes spin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
+  to { transform: rotate(360deg); }
 }
 
-
-
-h2 {
-    margin-left: 10px;
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-    font-weight: 500;
+#responseArea {
+  font-size: 14px;
+  color: var(--text-primary);
+  line-height: 1.75;
+  white-space: pre-wrap;
+  min-height: 24px;
 }
 
-h4 {
-    margin-left: 10px;
+#responseArea:empty::before {
+  content: "Your enriched output and translated output will appear here.";
+  color: var(--text-hint);
+  font-style: italic;
 }
-
-p[id="filenameStatement"] {
-    margin-left: 20px;
-}
-
-p[id="questionStatement"] {
-    margin-left: 20px;
-    margin-top: 10px;
-}
-
-p[id="responseArea"] {
-    white-space: pre-wrap
-}
-
-
-
