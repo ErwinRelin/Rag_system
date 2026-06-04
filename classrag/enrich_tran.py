@@ -10,12 +10,13 @@ from langchain_ollama import ChatOllama
 from langchain_chroma import Chroma
 from langchain_experimental.open_clip import OpenCLIPEmbeddings
 from deep_translator import GoogleTranslator
+from langchain_core.callbacks import BaseCallbackHandler
 import chromadb
 import uuid
 import logging
 from langchain_core.tracers.context import collect_runs
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import config
 
@@ -23,26 +24,103 @@ import config
 from tanglish import english_to_tanglish
 
 
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_API_KEY"] = config.MY_API_KEY
+# os.environ["LANGCHAIN_TRACING_V2"] = "true"
+# os.environ["LANGCHAIN_API_KEY"] = config.MY_API_KEY
 
 # ── models ─────────────────────────────────────────────────────────────────────
 
-llm = ChatOllama(model="qwen2.5vl:7custom", temperature=0)
+llm = ChatOllama(model="gemma3:12b", temperature=0)
 embedding_fn = OpenCLIPEmbeddings()
 
-logging.basicConfig(level=logging.INFO, filename=r"C:\Users\Erwin\Desktop\rag_system\classrag\ultimate_llm_system.json", format="%(asctime)s - %(message)s")
+ENRICHMENT_PROMPT = """
+You are a senior Business Analyst creating developer-ready defect descriptions.
 
-ENRICHMENT_PROMPT = """You are a technical writer. Using ONLY the BRD context below, rewrite the issue description into a single clear, specific sentence that identifies the exact component, the broken behavior, and the expected behavior.
+Using ONLY the BRD context, issue description, and expected outcome, rewrite the issue as a single concise defect statement.
 
-Context: {context}
-Issue Description: {issue_description}
-Expected Outcome: {expected_result}
+Rules:
+- Describe the current incorrect behavior, not the desired behavior.
+- Identify the affected component, workflow, field, API, or UI element when possible.
+- Include relevant business or system impact if directly related to the issue.
+- Use BRD terminology where applicable.
+- Preserve all meaningful details from the issue and expected outcome.
+- Do not invent new defects, side effects, fields, or requirements.
+- Do not write acceptance criteria.
+- Do not use phrases such as:
+  - "should"
+  - "must"
+  - "needs to"
+  - "expected to"
+- Write in defect format:
+  [Component] + [Incorrect Behavior] + [Impact]
 
-Output one sentence only. No headings, no bullet points, no explanation.
+Context:
+{context}
+
+Issue Description:
+{issue_description}
+
+Expected Outcome:
+{expected_result}
+
+Output one sentence only.
 """
 
+OUTPUT_LOG_PATH = r"C:\Users\Erwin\Desktop\ultimate_llm_system.json"
 
+# class UltimateLoggingHandler(BaseCallbackHandler):
+#     """A clean event listener that hooks directly into the LLM lifecycle."""
+    
+#     def __init__(self, user_id: str, custom_context: str):
+#         super().__init__()
+#         self.user_id = user_id
+#         self.custom_context = custom_context
+#         self.start_time = None
+
+#     def on_llm_start(self, serialized, prompts, **kwargs):
+#         """Triggers exactly when the prompt leaves your computer."""
+#         self.start_time = datetime.now(timezone.utc)
+
+#     def on_llm_end(self, response, **kwargs):
+#         """Triggers exactly when the model outputs text."""
+#         end_time = datetime.now(timezone.utc)
+#         duration_ms = (end_time - self.start_time).total_seconds() * 1000 if self.start_time else 0
+        
+#         # 1. Safely extract standard generation text and run IDs
+#         generation_info = response.generations[0][0]
+#         final_text = generation_info.text
+#         run_id = kwargs.get("run_id", "unknown-id")
+        
+#         # 2. Extract Token counts safely from LangChain response structures
+#         llm_output = response.llm_output or {}
+#         token_usage = llm_output.get("token_usage", {}) or {}
+        
+#         # 3. Create a clean structured payload map
+#         full_telemetry = {
+#             "identity": {
+#                 "run_id": str(run_id),
+#                 "user_id": self.user_id
+#             },
+#             "performance": {
+#                 "started_at": self.start_time.isoformat() if self.start_time else None,
+#                 "ended_at": end_time.isoformat(),
+#                 "duration_ms": round(duration_ms, 2)
+#             },
+#             "data": {
+#                 "passed_context": self.custom_context,
+#                 "final_output": final_text,
+#                 "generation_metadata": generation_info.generation_info
+#             },
+#             "usage": {
+#                 "prompt_tokens": token_usage.get("prompt_tokens", 0),
+#                 "completion_tokens": token_usage.get("completion_tokens", 0),
+#                 "total_tokens": token_usage.get("total_tokens", 0)
+#             }
+#         }
+        
+#         # 4. Instantly append directly to your desktop file line-by-line
+#         with open(OUTPUT_LOG_PATH, "a", encoding="utf-8") as f:
+#             f.write(json.dumps(full_telemetry) + "\n")
+#         print(f"✅ Callback Success! Telemetry written directly to: {OUTPUT_LOG_PATH}")
 
 # ── context retrieval ──────────────────────────────────────────────────────────
 class enrichment_transalation():
@@ -66,6 +144,8 @@ class enrichment_transalation():
                 print(d.page_content[:700])
 
             print("\n====================")
+            
+            return "\n\n".join(d.page_content for d in docs)
 
         return context_from_inputs
 
@@ -115,6 +195,19 @@ class enrichment_transalation():
 
     # ── enrichment ─────────────────────────────────────────────────────────────────
 
+
+
+    def on_llm_error(self, error, **kwargs):
+        """Triggers automatically if the model crashes or times out."""
+        error_payload = {
+            "status": "CRASHED",
+            "error_message": str(error),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        with open(OUTPUT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(error_payload) + "\n")
+
+
     def build_enrichment_chain(self, context_fn):
         # Using itemgetter or explicit lambdas ensures LangChain treats this dict as a RunnableMap
         
@@ -136,77 +229,15 @@ class enrichment_transalation():
     def enrich_issue(self, context_fn, issue_description: str, expected_result: str = "") -> str:
         chain = self.build_enrichment_chain(context_fn)
 
-        
+        # logger_callback = UltimateLoggingHandler(user_id="Erwin_Local", custom_context=context_fn)
 
-        response = ""
-        error_occurred = None
-            
-        with collect_runs() as cb:
-            try:
-                response = chain.invoke({
-                    "issue_description": issue_description,
-                    "expected_result": expected_result,
-                })
-            except Exception as e:
-                # Capture system crashes or API timeout details
-                error_occurred = {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "traceback": traceback.format_exc()
-                }
-                response = "An internal execution error occurred."
-            
-            # Extract every piece of underlying metadata from LangSmith
-            if cb.traced_runs:
-                run = cb.traced_runs[0]
-                
-                # 1. Calculate ultra-precise latencies
-                start_time = run.start_time
-                end_time = run.end_time if run.end_time else datetime.now()
-                total_duration_ms = (end_time - start_time).total_seconds() * 1000
-
-                usage = getattr(run, "usage", {}) or {}
-                prompt_tokens = usage.get("prompt_tokens", 0) or 0
-                completion_tokens = usage.get("completion_tokens", 0) or 0
-                
-                # 2. Build the ultimate structured data payload
-                ultimate_log = {
-                    "trace_identity": {
-                        "run_id": str(run.id),
-                        "project_name": os.environ.get("LANGCHAIN_PROJECT", "default"),
-                        "run_name": run.name,
-                        "execution_status": "FAILED" if error_occurred else "SUCCESS"
-                    },
-                    "timestamps": {
-                        "started_at": start_time.isoformat(),
-                        "ended_at": end_time.isoformat(),
-                        "total_duration_ms": round(total_duration_ms, 2)
-                    },
-                    "raw_inputs": {
-                        "variables_passed": {
-                            "issue_description": issue_description,
-                            "expected_result": expected_result
-                        },
-                        "langsmith_captured_inputs": run.inputs
-                    },
-                    "raw_outputs": {
-                        "final_string_response": response,
-                        "langsmith_captured_outputs": run.outputs
-                    },
+        response = chain.invoke({
+            "issue_description": issue_description,
+            "expected_result": expected_result},
+            # config={"callbacks": [logger_callback]}
+        )
                     
-                    "usage_metrics": {
-                        "token_counts": prompt_tokens + completion_tokens,
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "extra_metadata": run.extra or {}
-                    },
-                    "errors": error_occurred
-                }
-                
-                # Write everything as a single line of minified JSON
-                logging.info(json.dumps(ultimate_log))
-                    
-            return response
+        return response
 
     # ── translation ────────────────────────────────────────────────────────────────
 
@@ -250,8 +281,8 @@ if __name__ == "__main__":
     enrich_translation = enrichment_transalation()
 
     result = (enrich_translation.run_standalone(
-        file_path=r"C:\Users\Erwin\Desktop\rag_system\classrag\screen\Real Estate Property Management\Tenant Portal\Tenant Portal.pdf",
-        issue_description="The 'Pay Rent' button is red, which users are confusing with an error message."
+        file_path=r"C:\Users\Erwin\Desktop\rag_system\classrag\screen\Real Estate Property Management\Contractor View\Contractor View.pdf",
+        issue_description="Offline contractor update overwrites higher priority assignment changes after reconnection."
         ))
 
     print(f"\nEnriched : {result['enriched_issue']}")
