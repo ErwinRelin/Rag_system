@@ -13,6 +13,10 @@ from langchain_core.documents import Document
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore
 import ollama
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage
+from langchain.agents import create_agent
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -43,15 +47,14 @@ def get_child_by_type(node, child_type: str):
             return child
     return None
 
-# Cleaned up formatting helper: removed dependencies/usings loops entirely
 def format_chunk_text(text, file_path, class_name=None, method_name=None):
     header_lines = [f"// FILE: {file_path}"]
-        
+
     if class_name:
         header_lines.append(f"// CLASS: {class_name}")
     if method_name:
         header_lines.append(f"// METHOD: {method_name}")
-        
+
     header = "\n".join(header_lines) + "\n\n"
     return header + text
 
@@ -65,7 +68,7 @@ def get_csharp_usings_and_block(tree, source: bytes):
         if node.type == "using_directive":
             if node.start_byte < min_byte: min_byte = node.start_byte
             if node.end_byte > max_byte:   max_byte = node.end_byte
-            
+
             raw_statement = source[node.start_byte:node.end_byte].decode("utf-8").strip()
             if raw_statement not in using_list:
                 using_list.append(raw_statement)
@@ -76,28 +79,31 @@ def get_csharp_usings_and_block(tree, source: bytes):
     if min_byte == float('inf'): return [], None
     return using_list, source[int(min_byte):int(max_byte)].decode("utf-8")
 
+
+# FIX #1 & #2: Removed the erroneous `for file_path in folder_path` loop.
+# `file_path` is now a plain string parameter, used directly.
 def process_csharp_class(class_node, source: bytes, file_path: str, usings=None) -> list:
     usings = usings or []
     method_chunks = []
-    
+
     name_node = get_child_by_type(class_node, "identifier")
     class_name = node_text(name_node, source) if name_node else "UnknownContainer"
-    
-    # 1. Prepare the Class Chunk text without passing dependencies to the formatter
+
+    # 1. Prepare the Class Chunk
     class_raw_text = node_text(class_node, source)
     class_formatted_text = format_chunk_text(class_raw_text, file_path, class_name=class_name)
-    
+
     class_chunk = {
         "type":       "interface" if class_node.type == "interface_declaration" else "class",
         "class_name": class_name,
-        "language": "c-sharp",
+        "language":   "c-sharp",
         "file_path":  file_path,
-        "usings":     usings, # Saved in database metadata array only
+        "usings":     usings,
         "text":       class_formatted_text,
         "start_line": class_node.start_point,
         "end_line":   class_node.end_point
     }
-    
+
     if class_node.type == "interface_declaration":
         return [class_chunk]
 
@@ -111,64 +117,83 @@ def process_csharp_class(class_node, source: bytes, file_path: str, usings=None)
                 chunk_type = "constructor" if child.type == "constructor_declaration" else "method"
 
                 method_start = child.start_point[0] + 1
-                method_end = child.end_point[0] + 1
-                
+                method_end   = child.end_point[0] + 1
+
                 method_chunks.append({
                     "type":        chunk_type,
                     "class_name":  class_name,
                     "method_name": member_name,
-                    "language": "c-sharp",
+                    "language":    "c-sharp",
                     "file_path":   file_path,
-                    "usings":      usings, # Saved in database metadata array only
-                    "text":        format_chunk_text(node_text(child, source), file_path, class_name=class_name, method_name=member_name),
+                    "usings":      usings,
+                    "text":        format_chunk_text(
+                                       node_text(child, source),
+                                       file_path,
+                                       class_name=class_name,
+                                       method_name=member_name
+                                   ),
                     "start_line":  method_start,
                     "end_line":    method_end
                 })
 
-    if len(method_chunks) == 1:
-        return method_chunks
-
+    # FIX #3: Always return class_chunk + method_chunks.
+    # The old `if len(method_chunks) == 1: return method_chunks` dropped the
+    # class chunk when a class had exactly one method — now removed.
     return [class_chunk] + method_chunks
 
 
 # ── Main Entrypoint ──────────────────────────────────────────────────────────
+
+# FIX #4: Processes a single .cs file. The old version looped over the string
+# characters of the path and returned inside the loop (early exit on first char).
 def chunk_csharp_file(file_path: str) -> list:
     with open(file_path, "rb") as f:
         source = f.read()
 
     tree = parser.parse(source)
     chunks = []
-    
-    # 1. Gather all top-level `using` statements into their single standalone chunk
+
+    # 1. Gather all top-level `using` statements
     usings, raw_using_block = get_csharp_usings_and_block(tree, source)
     if raw_using_block:
         chunks.append({
-            "type":      "imports",
-            "language": 'c-sharp',
-            "file_path": file_path,
-            "text":      f"// FILE: {file_path}\n// USINGS\n\n{raw_using_block}",
-            "usings":    usings,
+            "type":       "imports",
+            "language":   "c-sharp",
+            "file_path":  file_path,
+            "text":       f"// FILE: {file_path}\n// USINGS\n\n{raw_using_block}",
+            "usings":     usings,
             "start_line": 1,
-            "end_line": raw_using_block.count('\n') + 1
+            "end_line":   raw_using_block.count('\n') + 1
         })
-        
+
     # 2. Structural tree walker
     def find_code_blocks(node):
-        if node.type in ("class_declaration", "interface_declaration", "struct_declaration", "record_declaration"):
+        if node.type in ("class_declaration", "interface_declaration",
+                         "struct_declaration", "record_declaration"):
             chunks.extend(process_csharp_class(node, source, file_path, usings=usings))
             return
-
         elif node.type in ("namespace_declaration", "file_scoped_namespace_declaration"):
             for child in node.children:
                 find_code_blocks(child)
             return
-            
         for child in node.children:
             find_code_blocks(child)
 
     find_code_blocks(tree.root_node)
     return chunks
 
+
+# NEW: Walks a directory and chunks every .cs file found.
+def chunk_csharp_directory(dir_path: str) -> list:
+    all_chunks = []
+    for filename in os.listdir(dir_path):
+        if filename.endswith(".cs"):
+            file_path = os.path.join(dir_path, filename)
+            all_chunks.extend(chunk_csharp_file(file_path))
+    return all_chunks
+
+
+# ── RAG Pipeline ─────────────────────────────────────────────────────────────
 class CodebaseRAGPipeline:
     def __init__(self, llm_instance, collection_name="codebase_rag"):
         self.qdrant_client = QdrantClient(url="http://localhost:6333")
@@ -186,11 +211,14 @@ class CodebaseRAGPipeline:
             )
 
     def clear_collection(self):
+        
         self.qdrant_client.delete_collection(self.collection_name)
         self._ensure_collection_exists()
         print(f"Collection '{self.collection_name}' cleared and recreated.")
+        info = self.qdrant_client.get_collection(self.collection_name)
+        print("Points after clear:", info.points_count)
 
-    def store_chunks(self, chunks: list, metadata_list: list = None):  # ← ADD THIS METHOD
+    def store_chunks(self, chunks: list, metadata_list: list = None):
         points = []
         for idx, text in enumerate(chunks):
             payload = metadata_list[idx] if metadata_list else {}
@@ -224,40 +252,83 @@ class CodebaseRAGPipeline:
             block = (
                 f"--- Code Chunk {idx + 1} ---\n"
                 f"File: {payload.get('file_path', 'Unknown File')}\n"
-                f"Content:\n{payload.get('page_content', 'No content.')}\n"  # ← fixed key
+                f"Content:\n{payload.get('page_content', 'No content.')}\n"
             )
             formatted_blocks.append(block)
 
         return "\n".join(formatted_blocks)
 
-    def ask(self, question: str, generation: bool=False) -> str:
-        
+    def ask(self, question: str, generation: bool = False) -> str:
+        template = template = """You are an expert C# code generation assistant.
 
-        template = """You are an expert C# code assistant. You can both explain existing code and generate new code.
-Operate in one of two modes based on the question:
+Your task is to generate code modifications using ONLY the provided context and available files.
 
-**EXPLANATION MODE** (when asked to explain, describe, or trace existing code):
-- Reference specific class names, method names, or file paths when relevant
-- Walk through the logic step by step
-- Synthesize information across multiple chunks if needed
-- If the answer is not present in the context, say "This information is not available in the provided code chunks."
-- Do NOT hallucinate method names, variables, or behavior not shown in the context
-
-**GENERATION MODE** (when asked to create, implement, add, or modify code):
-- Use the provided code chunks as context to match the existing code style, patterns, and architecture
-- Generate clean, complete C# code that integrates naturally with the existing codebase
-- Follow the same naming conventions, design patterns, and structure seen in the context
-- Add brief inline comments explaining key decisions
-- If the request is ambiguous, state your assumptions before generating
-
-Rules that apply to BOTH modes:
-- Display only the answer and nothing else
-- Do not include any preamble or closing remarks
-
-Context (relevant code chunks):
+Context:
 {context}
 
-Question: {question}
+Question:
+{question}
+
+Instructions:
+
+- Follow the existing code style, architecture, naming conventions, and patterns found in the context.
+- Generate clean, compilable C# code.
+- Include any required dependencies for the generated code.
+- Do NOT rewrite entire files unless explicitly requested.
+- Do NOT invent files, classes, methods, namespaces, or project structure.
+- file_path MUST be selected from the Available Files list.
+- If the requested change cannot be implemented using the available files and context, return INSUFFICIENT_CONTEXT.
+- If multiple code changes are required, return multiple change objects.
+- Return ONLY valid JSON.
+- Do NOT include markdown.
+- Do NOT include explanations outside the JSON.
+
+Output Schema:
+
+{{
+  "status": "SUCCESS" | "INSUFFICIENT_CONTEXT",
+  "reason": "",
+  "changes": [
+    {{
+      "file_path": "",
+      "target_scope": "",
+      "operation": "INSERT | REPLACE | APPEND",
+      "new_code": ""
+    }}
+  ]
+}}
+
+Rules:
+
+1. file_path must exactly match one of the files listed in Available Files.
+2. target_scope should identify where the code belongs (e.g. Program, Main, Employee).
+3. operation must be one of:
+   - INSERT
+   - REPLACE
+   - APPEND
+4. new_code must contain only valid C# code.
+5. If no suitable file exists, return:
+
+{{
+  "status": "INSUFFICIENT_CONTEXT",
+  "reason": "Required file or code structure not found in available context.",
+  "changes": []
+}}
+
+Example Success Response:
+
+{{
+  "status": "SUCCESS",
+  "reason": "",
+  "changes": [
+    {{
+      "file_path": "C:\\Projects\\Demo\\Program.cs",
+      "target_scope": "Program",
+      "operation": "INSERT",
+      "new_code": "public static double AverageEmployeeId(List<Employee> employees)\n{{\n    return employees.Average(e => e.Id);\n}}"
+    }}
+  ]
+}}
 
 Answer:"""
 
@@ -272,31 +343,35 @@ Answer:"""
 
         return chain.invoke(question)
 
+# @tool
+# def read_file(file_path: str) -> str:
+#     """Reads the complete contents of a file from disk."""
+#     with open(file_path, "r", encoding="utf-8") as f:
+#         return f.read()
 
+# @tool
+# def append_to_file(file_path: str, content_to_append: str) -> str:
+#     """Appends new text safely to the end of a specific file without wiping it."""
+#     with open(file_path, "a", encoding="utf-8") as f:
+#         f.write("\n" + content_to_append)
+#     return f"Successfully appended content to {file_path}"
 
+# # Bundle the tools
+# tools = [read_file, append_to_file]
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    local_llm = ChatOllama(model="qwen2.5-custom:latest")
+    local_llm = ChatOllama(model="qwen2.5-coder:14b")
     rag_pipeline = CodebaseRAGPipeline(llm_instance=local_llm)
 
-    rag_pipeline.clear_collection()  # ← wipe before indexing
+    rag_pipeline.clear_collection()
 
-    chunks = chunk_csharp_file(r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\files\dummy_framework.cs")
-    texts = [c["text"] for c in chunks]
+    # FIX: Use chunk_csharp_directory to process all .cs files in the folder
+    chunks = chunk_csharp_directory(r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\DummyApplication")
+    texts    = [c["text"] for c in chunks]
     metadata = [{k: v for k, v in c.items() if k != "text"} for c in chunks]
     rag_pipeline.store_chunks(texts, metadata)
 
-    user_query = "Add a DeleteOrder method across all necessary classes and interfaces"
+    user_query = "Add a method that returns the average employee ID."
     ai_response = rag_pipeline.ask(user_query, generation=True)
     print(f"\nAI Response:\n{ai_response}")
-
-    # try:
-    #     # 2. Run your query logic
-    #     user_query = "Add a DeleteOrder method to the codebase. Implement it across all necessary classes and interfaces."
-    #     ai_response = rag_pipeline.ask(user_query)
-    #     print(f"\nAI Response:\n{ai_response}")
-        
-    # finally:
-    #     # 3. Force clean closure of database files before the script exits
-    #     print("\nClosing Qdrant database connections safely...")
-    #     rag_pipeline.qdrant_client.close()
-        
