@@ -17,6 +17,9 @@ from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage
 from langchain.agents import create_agent
+import re
+import subprocess
+import tempfile
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -100,8 +103,8 @@ def process_csharp_class(class_node, source: bytes, file_path: str, usings=None)
         "file_path":  file_path,
         "usings":     usings,
         "text":       class_formatted_text,
-        "start_line": class_node.start_point,
-        "end_line":   class_node.end_point
+        "start_line": class_node.start_point[0] + 1,
+        "end_line":   class_node.end_point[0] + 1,
     }
 
     if class_node.type == "interface_declaration":
@@ -252,6 +255,7 @@ class CodebaseRAGPipeline:
             block = (
                 f"--- Code Chunk {idx + 1} ---\n"
                 f"File: {payload.get('file_path', 'Unknown File')}\n"
+                f"Lines: {payload.get('start_line', '?')}–{payload.get('end_line', '?')}\n"
                 f"Content:\n{payload.get('page_content', 'No content.')}\n"
             )
             formatted_blocks.append(block)
@@ -259,105 +263,145 @@ class CodebaseRAGPipeline:
         return "\n".join(formatted_blocks)
 
     def ask(self, question: str, generation: bool = False) -> str:
-        template = template = """You are an expert C# code generation assistant.
-
-Your task is to generate code modifications using ONLY the provided context and available files.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Instructions:
-
-- Follow the existing code style, architecture, naming conventions, and patterns found in the context.
-- Generate clean, compilable C# code.
-- Include any required dependencies for the generated code.
-- Do NOT rewrite entire files unless explicitly requested.
-- Do NOT invent files, classes, methods, namespaces, or project structure.
-- file_path MUST be selected from the Available Files list.
-- If the requested change cannot be implemented using the available files and context, return INSUFFICIENT_CONTEXT.
-- If multiple code changes are required, return multiple change objects.
-- Return ONLY valid JSON.
-- Do NOT include markdown.
-- Do NOT include explanations outside the JSON.
-
-Output Schema:
-
-{{
-  "status": "SUCCESS" | "INSUFFICIENT_CONTEXT",
-  "reason": "",
-  "changes": [
-    {{
-      "file_path": "",
-      "target_scope": "",
-      "operation": "INSERT | REPLACE | APPEND",
-      "new_code": ""
-    }}
-  ]
-}}
-
-Rules:
-
-1. file_path must exactly match one of the files listed in Available Files.
-2. target_scope should identify where the code belongs (e.g. Program, Main, Employee).
-3. operation must be one of:
-   - INSERT
-   - REPLACE
-   - APPEND
-4. new_code must contain only valid C# code.
-5. If no suitable file exists, return:
-
-{{
-  "status": "INSUFFICIENT_CONTEXT",
-  "reason": "Required file or code structure not found in available context.",
-  "changes": []
-}}
-
-Example Success Response:
-
-{{
-  "status": "SUCCESS",
-  "reason": "",
-  "changes": [
-    {{
-      "file_path": "C:\\Projects\\Demo\\Program.cs",
-      "target_scope": "Program",
-      "operation": "INSERT",
-      "new_code": "public static double AverageEmployeeId(List<Employee> employees)\n{{\n    return employees.Average(e => e.Id);\n}}"
-    }}
-  ]
-}}
-
-Answer:"""
-
         limit = 8 if generation else 5
 
-        chain = (
-            {"context": lambda q: self.retriever(q, limit=limit), "question": RunnablePassthrough()}
-            | ChatPromptTemplate.from_template(template)
-            | self.llm
-            | StrOutputParser()
+        context = self.retriever(question, limit=limit)
+        print(f"\n--- Retrieved Context ---\n{context}\n")
+
+        template = """You are an expert C# software engineer.
+
+    Use the provided context as your primary reference. You may infer standard C# patterns to complete the implementation.
+
+    Context:
+    {context}
+
+    Task:
+    {question}
+
+    Generate a git patch for the required changes.
+    The line numbers in the context are the REAL line numbers in the file. Use them directly in @@ hunk headers.
+
+    Output format:
+
+    <git_patch>
+    --- a/<filepath>
+    +++ b/<filepath>
+    @@ -old_start,old_count +new_start,new_count @@
+    [3 context lines before change]
+    -[removed line]
+    +[added line]
+    [3 context lines after change]
+    </git_patch>
+
+    Rules:
+    - Use forward slashes in file paths (C:/Users/...)
+    - Only modify what the task requires
+    - Hunk line counts must be exact — wrong counts will break the patch
+    - Preserve all indentation and spacing
+    - Multiple files = multiple diff blocks inside one <git_patch>
+    - New file: use --- /dev/null and +++ b/<filepath>
+    - If context is insufficient to generate a valid patch, reply with: INSUFFICIENT_CONTEXT"""
+
+        prompt = ChatPromptTemplate.from_template(template)
+        chain = prompt | self.llm | StrOutputParser()
+
+        return chain.invoke({"context": context, "question": question})
+
+
+def extract_patch(llm_response: str) -> str | None:
+    # Try <git_patch> tags first
+    match = re.search(r"<git_patch>(.*?)</git_patch>", llm_response, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # Fallback: ```git_patch or ```diff code fences
+    match = re.search(r"```(?:git_patch|diff)(.*?)```", llm_response, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    return None
+
+def validate_patch(patch_content: str) -> dict:
+    lines = patch_content.splitlines()
+    errors = []
+    in_hunk = False
+
+    for i, line in enumerate(lines, 1):
+        if line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith(("---", "+++")):
+            continue
+        elif in_hunk and not line.startswith((" ", "+", "-", "\\")):
+            errors.append(f"Line {i}: invalid prefix — '{line[:40]}'")
+
+    return {"valid": len(errors) == 0, "errors": errors}
+
+    return {"valid": len(errors) == 0, "errors": errors}
+
+def fix_patch(patch_content: str) -> str:
+    lines = patch_content.splitlines()
+    fixed = []
+    in_hunk = False
+    hunk_pattern = re.compile(r"^(@@ -)(\d+)(,\d+)? (\+)(\d+)(,\d+)? (@@.*)")
+    pending_hunk = None
+    hunk_body = []
+
+    def flush_hunk():
+        if pending_hunk is None:
+            return []
+        old_start, new_start, suffix = pending_hunk
+        old_count = sum(1 for l in hunk_body if l.startswith(" ") or l.startswith("-"))
+        new_count = sum(1 for l in hunk_body if l.startswith(" ") or l.startswith("+"))
+        header = f"@@ -{old_start},{old_count} +{new_start},{new_count} {suffix}"
+        return [header] + hunk_body
+
+    for line in lines:
+        if line.startswith("diff --git"):
+            continue
+
+        m = hunk_pattern.match(line)
+        if m:
+            fixed.extend(flush_hunk())
+            hunk_body = []
+            in_hunk = True
+            pending_hunk = (m.group(2), m.group(5), m.group(7))
+        elif in_hunk:
+            if line == "":
+                hunk_body.append(" ")
+            elif line[0] not in ("+", "-", " ", "\\"):
+                hunk_body.append(" " + line)  # force context prefix if missing
+            else:
+                hunk_body.append(line)
+        else:
+            fixed.append(line)
+
+    fixed.extend(flush_hunk())
+    return "\n".join(fixed) + "\n"  # patch must end with newline
+
+def apply_patch(patch_content: str, repo_path: str) -> dict:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False, encoding="utf-8") as f:
+        f.write(patch_content)
+        patch_file = f.name
+
+    try:
+        check = subprocess.run(
+            ["git", "apply", "--check", "--whitespace=fix", patch_file],
+            cwd=repo_path, capture_output=True, text=True
         )
+        if check.returncode != 0:
+            return {"success": False, "error": check.stderr}
 
-        return chain.invoke(question)
-
-# @tool
-# def read_file(file_path: str) -> str:
-#     """Reads the complete contents of a file from disk."""
-#     with open(file_path, "r", encoding="utf-8") as f:
-#         return f.read()
-
-# @tool
-# def append_to_file(file_path: str, content_to_append: str) -> str:
-#     """Appends new text safely to the end of a specific file without wiping it."""
-#     with open(file_path, "a", encoding="utf-8") as f:
-#         f.write("\n" + content_to_append)
-#     return f"Successfully appended content to {file_path}"
-
-# # Bundle the tools
-# tools = [read_file, append_to_file]
+        result = subprocess.run(
+            ["git", "apply", "--whitespace=fix", patch_file],
+            cwd=repo_path, capture_output=True, text=True
+        )
+        return {
+            "success": result.returncode == 0,
+            "output": result.stdout,
+            "error": result.stderr or None
+        }
+    finally:
+        os.unlink(patch_file)
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -366,12 +410,33 @@ if __name__ == "__main__":
 
     rag_pipeline.clear_collection()
 
-    # FIX: Use chunk_csharp_directory to process all .cs files in the folder
     chunks = chunk_csharp_directory(r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\DummyApplication")
     texts    = [c["text"] for c in chunks]
     metadata = [{k: v for k, v in c.items() if k != "text"} for c in chunks]
     rag_pipeline.store_chunks(texts, metadata)
 
-    user_query = "Add a method that returns the average employee ID."
+    user_query = "Add a method to EmployeeService that returns all employees with a configured email address."
+    repo_path = r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\DummyApplication"
+
     ai_response = rag_pipeline.ask(user_query, generation=True)
-    print(f"\nAI Response:\n{ai_response}")
+    print(f"\n--- LLM Response ---\n{ai_response}\n")
+
+    patch = extract_patch(ai_response)
+
+    if patch:
+        patch = fix_patch(patch)  # auto-fix empty context lines
+        print(f"--- Extracted Patch ---\n{patch}\n")
+
+        validation = validate_patch(patch)
+        if not validation["valid"]:
+            print("Patch validation failed:")
+            for err in validation["errors"]:
+                print(f"  - {err}")
+        else:
+            result = apply_patch(patch, repo_path)
+            if result["success"]:
+                print("Patch applied successfully")
+            else:
+                print(f"Patch failed:\n{result['error']}")
+    else:
+        print("No patch found — model may have returned INSUFFICIENT_CONTEXT")
