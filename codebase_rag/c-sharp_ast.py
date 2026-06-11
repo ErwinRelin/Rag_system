@@ -20,6 +20,7 @@ from langchain.agents import create_agent
 import re
 import subprocess
 import tempfile
+import json
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────
@@ -61,6 +62,19 @@ def format_chunk_text(text, file_path, class_name=None, method_name=None):
     header = "\n".join(header_lines) + "\n\n"
     return header + text
 
+def find_nodes(node, node_type):
+    results = []
+
+    def walk(n):
+        if n.type == node_type:
+            results.append(n)
+
+        for child in n.children:
+            walk(child)
+
+    walk(node)
+    return results
+
 # ── Extractors ───────────────────────────────────────────────────────────────
 def get_csharp_usings_and_block(tree, source: bytes):
     using_list = []
@@ -82,7 +96,22 @@ def get_csharp_usings_and_block(tree, source: bytes):
     if min_byte == float('inf'): return [], None
     return using_list, source[int(min_byte):int(max_byte)].decode("utf-8")
 
+def extract_method_calls(method_node, source):
+    calls = []
 
+    invocations = find_nodes(method_node, "invocation_expression")
+
+    for invocation in invocations:
+        expression = invocation.child_by_field_name("function")
+
+        if not expression:
+            continue
+
+        call_text = node_text(expression, source)
+
+        calls.append(call_text)
+
+    return calls
 # FIX #1 & #2: Removed the erroneous `for file_path in folder_path` loop.
 # `file_path` is now a plain string parameter, used directly.
 def process_csharp_class(class_node, source: bytes, file_path: str, usings=None) -> list:
@@ -105,6 +134,7 @@ def process_csharp_class(class_node, source: bytes, file_path: str, usings=None)
         "text":       class_formatted_text,
         "start_line": class_node.start_point[0] + 1,
         "end_line":   class_node.end_point[0] + 1,
+        "method_calls": extract_method_calls()
     }
 
     if class_node.type == "interface_declaration":
@@ -136,7 +166,8 @@ def process_csharp_class(class_node, source: bytes, file_path: str, usings=None)
                                        method_name=member_name
                                    ),
                     "start_line":  method_start,
-                    "end_line":    method_end
+                    "end_line":    method_end,
+                    "method_calls": extract_method_calls()
                 })
 
     # FIX #3: Always return class_chunk + method_chunks.
@@ -166,7 +197,9 @@ def chunk_csharp_file(file_path: str) -> list:
             "text":       f"// FILE: {file_path}\n// USINGS\n\n{raw_using_block}",
             "usings":     usings,
             "start_line": 1,
-            "end_line":   raw_using_block.count('\n') + 1
+            "end_line":   raw_using_block.count('\n') + 1,
+            "method_calls": extract_method_calls()
+
         })
 
     # 2. Structural tree walker
@@ -263,145 +296,305 @@ class CodebaseRAGPipeline:
         return "\n".join(formatted_blocks)
 
     def ask(self, question: str, generation: bool = False) -> str:
+        template = template = """You are an expert C# code generation assistant.
+
+Use only the provided context.
+
+Return only valid JSON.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Schema:
+
+{{
+  "status": "SUCCESS | INSUFFICIENT_CONTEXT",
+  "changes": [
+    {{
+      "file_path": "",
+      "target_scope": "",
+      "operation": "",
+      "anchor": "",
+      "new_code": ""
+    }}
+  ]
+}}
+
+File Path Rules:
+
+- Use absolute file paths.
+- Use forward slashes (/) only.
+- Never use backslashes (\).
+
+Example:
+C:/Users/Erwin/Desktop/rag_system/codebase_rag/DummyApplication/EmployeeService.cs
+
+target_scope must contain the actual class or method name.
+
+Examples:
+- Employee
+- EmployeeService
+- Program
+- Main
+- Employee.DisplayInfo
+
+Never use generic values:
+- CLASS
+- METHOD
+- FUNCTION
+- CODE
+
+Valid operations:
+- APPEND_TO_CLASS
+- INSERT_AFTER
+- INSERT_BEFORE
+- REPLACE_METHOD
+- CREATE_FILE
+
+Rules:
+- Use existing files unless CREATE_FILE.
+- Use specific target scopes.
+- Return only JSON."""
+
         limit = 8 if generation else 5
 
-        context = self.retriever(question, limit=limit)
-        print(f"\n--- Retrieved Context ---\n{context}\n")
+        chain = (
+            {"context": lambda q: self.retriever(q, limit=limit), "question": RunnablePassthrough()}
+            | ChatPromptTemplate.from_template(template)
+            | self.llm
+            | StrOutputParser()
+        )
 
-        template = """You are an expert C# software engineer.
+        return chain.invoke(question)
 
-    Use the provided context as your primary reference. You may infer standard C# patterns to complete the implementation.
+def apply_codebase_changes_with_logging(json_data):
+    data = json.loads(json_data)
+    
+    if data.get("status") != "SUCCESS":
+        print(f"❌ Aborting: JSON status is '{data.get('status')}', not 'SUCCESS'.")
+        return
 
-    Context:
-    {context}
+    print(f"🔍 Found {len(data['changes'])} total task(s) to process.")
 
-    Task:
-    {question}
+    for idx, change in enumerate(data["changes"], 1):
+        file_path = change["file_path"]
+        operation = change["operation"]
+        target_scope = change["target_scope"]
+        anchor = change["anchor"]
+        new_code = change["new_code"]
+        
+        print(f"\n--- Task {idx}: {operation} on {target_scope} ---")
+        print(f"📂 Checking path: {file_path}")
 
-    Generate a git patch for the required changes.
-    The line numbers in the context are the REAL line numbers in the file. Use them directly in @@ hunk headers.
-
-    Output format:
-
-    <git_patch>
-    --- a/<filepath>
-    +++ b/<filepath>
-    @@ -old_start,old_count +new_start,new_count @@
-    [3 context lines before change]
-    -[removed line]
-    +[added line]
-    [3 context lines after change]
-    </git_patch>
-
-    Rules:
-    - Use forward slashes in file paths (C:/Users/...)
-    - Only modify what the task requires
-    - Hunk line counts must be exact — wrong counts will break the patch
-    - Preserve all indentation and spacing
-    - Multiple files = multiple diff blocks inside one <git_patch>
-    - New file: use --- /dev/null and +++ b/<filepath>
-    - If context is insufficient to generate a valid patch, reply with: INSUFFICIENT_CONTEXT"""
-
-        prompt = ChatPromptTemplate.from_template(template)
-        chain = prompt | self.llm | StrOutputParser()
-
-        return chain.invoke({"context": context, "question": question})
-
-
-def extract_patch(llm_response: str) -> str | None:
-    # Try <git_patch> tags first
-    match = re.search(r"<git_patch>(.*?)</git_patch>", llm_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-
-    # Fallback: ```git_patch or ```diff code fences
-    match = re.search(r"```(?:git_patch|diff)(.*?)```", llm_response, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-
-    return None
-
-def validate_patch(patch_content: str) -> dict:
-    lines = patch_content.splitlines()
-    errors = []
-    in_hunk = False
-
-    for i, line in enumerate(lines, 1):
-        if line.startswith("@@"):
-            in_hunk = True
-        elif line.startswith(("---", "+++")):
-            continue
-        elif in_hunk and not line.startswith((" ", "+", "-", "\\")):
-            errors.append(f"Line {i}: invalid prefix — '{line[:40]}'")
-
-    return {"valid": len(errors) == 0, "errors": errors}
-
-    return {"valid": len(errors) == 0, "errors": errors}
-
-def fix_patch(patch_content: str) -> str:
-    lines = patch_content.splitlines()
-    fixed = []
-    in_hunk = False
-    hunk_pattern = re.compile(r"^(@@ -)(\d+)(,\d+)? (\+)(\d+)(,\d+)? (@@.*)")
-    pending_hunk = None
-    hunk_body = []
-
-    def flush_hunk():
-        if pending_hunk is None:
-            return []
-        old_start, new_start, suffix = pending_hunk
-        old_count = sum(1 for l in hunk_body if l.startswith(" ") or l.startswith("-"))
-        new_count = sum(1 for l in hunk_body if l.startswith(" ") or l.startswith("+"))
-        header = f"@@ -{old_start},{old_count} +{new_start},{new_count} {suffix}"
-        return [header] + hunk_body
-
-    for line in lines:
-        if line.startswith("diff --git"):
+        if not os.path.exists(file_path):
+            print(f"❌ Error: Python cannot locate this file on disk! Check folder path permissions.")
             continue
 
-        m = hunk_pattern.match(line)
-        if m:
-            fixed.extend(flush_hunk())
-            hunk_body = []
-            in_hunk = True
-            pending_hunk = (m.group(2), m.group(5), m.group(7))
-        elif in_hunk:
-            if line == "":
-                hunk_body.append(" ")
-            elif line[0] not in ("+", "-", " ", "\\"):
-                hunk_body.append(" " + line)  # force context prefix if missing
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        modified_lines = []
+        insert_index = -1
+        
+        # --- PROCESSING APPEND_TO_CLASS ---
+        if operation == "APPEND_TO_CLASS":
+            found_class = False
+            brace_count = 0
+            
+            for line_idx, line in enumerate(lines):
+                if f"class {target_scope}" in line:
+                    found_class = True
+                if found_class:
+                    brace_count += line.count("{")
+                    brace_count -= line.count("}")
+                    if brace_count == 0 and "}" in line:
+                        insert_index = line_idx
+                        break
+            
+            if insert_index != -1:
+                clean_code = new_code.strip()
+                padded_code = f"        {clean_code}\n"
+                lines.insert(insert_index, padded_code)
+                modified_lines = lines
+                print(f"✅ Matched class boundary! Ready to insert at line {insert_index + 1}.")
             else:
-                hunk_body.append(line)
-        else:
-            fixed.append(line)
+                print(f"❌ Error: Could not parse brace structure for class '{target_scope}'.")
+                modified_lines = lines
 
-    fixed.extend(flush_hunk())
-    return "\n".join(fixed) + "\n"  # patch must end with newline
+        # --- PROCESSING INSERT_AFTER METHOD BOUNDARY ---
+        elif operation == "INSERT_AFTER":
+            found_anchor = False
+            brace_count = 0
+            method_started = False
 
-def apply_patch(patch_content: str, repo_path: str) -> dict:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False, encoding="utf-8") as f:
-        f.write(patch_content)
-        patch_file = f.name
+            for line_idx, line in enumerate(lines):
+                if anchor in line:
+                    found_anchor = True
+                
+                if found_anchor:
+                    if "{" in line:
+                        brace_count += line.count("{")
+                        method_started = True
+                    if "}" in line:
+                        brace_count -= line.count("}")
+                    
+                    if method_started and brace_count == 0:
+                        insert_index = line_idx + 1
+                        break
+            
+            if insert_index != -1:
+                clean_method = new_code.strip('\n')
+                lines.insert(insert_index, f"\n{clean_method}\n")
+                modified_lines = lines
+                print(f"✅ Found closing brace of method! Ready to insert at line {insert_index + 1}.")
+            else:
+                print(f"❌ Error: Could not locate method signature string: '{anchor}'")
+                modified_lines = lines
 
-    try:
-        check = subprocess.run(
-            ["git", "apply", "--check", "--whitespace=fix", patch_file],
-            cwd=repo_path, capture_output=True, text=True
-        )
-        if check.returncode != 0:
-            return {"success": False, "error": check.stderr}
+        # Write to temp file and overwrite safely
+        if insert_index != -1:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as temp_file:
+                temp_path = temp_file.name
+                temp_file.writelines(modified_lines)
 
-        result = subprocess.run(
-            ["git", "apply", "--whitespace=fix", patch_file],
-            cwd=repo_path, capture_output=True, text=True
-        )
-        return {
-            "success": result.returncode == 0,
-            "output": result.stdout,
-            "error": result.stderr or None
-        }
-    finally:
-        os.unlink(patch_file)
+            try:
+                os.replace(temp_path, file_path)
+                print(f"🎉 Successfully modified and updated file: {os.path.basename(file_path)}")
+            except Exception as e:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                print(f"❌ File Swap Failure: {e}")
+
+def verify_dotnet_syntax():
+    print("\n Starting .NET multi-project syntax verification...")
+    
+    # This is the exact PowerShell script compressed into a single-line execution string
+    ps_script = (
+        "Get-ChildItem -Recurse -Filter *.csproj | ForEach-Object { "
+        "Write-Host 'Checking Syntax:' $_.Name; "
+        "dotnet build $_.FullName --no-incremental /p:BuildProjectReferences=false /v:quiet "
+        "}"
+    )
+    
+    # We call powershell.exe and pass the script securely via the -Command argument
+    result = subprocess.run(
+        ["powershell.exe", "-Command", ps_script],
+        capture_output=True,
+        text=True
+    )
+    
+    # Print the terminal outputs so you can see any compilation syntax errors
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(f"System/Shell Errors:\n{result.stderr}")
+        
+    # Check if the execution context encountered errors
+    if "error CS" in result.stdout or result.returncode != 0:
+        print("❌ Syntax verification failed! Errors found in the codebase.")
+        return False
+    else:
+        print("✅ Syntax verification passed! All projects are clean.")
+        return True
+
+
+# def extract_patch(llm_response: str) -> str | None:
+#     # Try <git_patch> tags first
+#     match = re.search(r"<git_patch>(.*?)</git_patch>", llm_response, re.DOTALL)
+#     if match:
+#         return match.group(1).strip()
+
+#     # Fallback: ```git_patch or ```diff code fences
+#     match = re.search(r"```(?:git_patch|diff)(.*?)```", llm_response, re.DOTALL)
+#     if match:
+#         return match.group(1).strip()
+
+#     return None
+
+# def validate_patch(patch_content: str) -> dict:
+#     lines = patch_content.splitlines()
+#     errors = []
+#     in_hunk = False
+
+#     for i, line in enumerate(lines, 1):
+#         if line.startswith("@@"):
+#             in_hunk = True
+#         elif line.startswith(("---", "+++")):
+#             continue
+#         elif in_hunk and not line.startswith((" ", "+", "-", "\\")):
+#             errors.append(f"Line {i}: invalid prefix — '{line[:40]}'")
+
+#     return {"valid": len(errors) == 0, "errors": errors}
+
+#     return {"valid": len(errors) == 0, "errors": errors}
+
+# def fix_patch(patch_content: str) -> str:
+#     lines = patch_content.splitlines()
+#     fixed = []
+#     in_hunk = False
+#     hunk_pattern = re.compile(r"^(@@ -)(\d+)(,\d+)? (\+)(\d+)(,\d+)? (@@.*)")
+#     pending_hunk = None
+#     hunk_body = []
+
+#     def flush_hunk():
+#         if pending_hunk is None:
+#             return []
+#         old_start, new_start, suffix = pending_hunk
+#         old_count = sum(1 for l in hunk_body if l.startswith(" ") or l.startswith("-"))
+#         new_count = sum(1 for l in hunk_body if l.startswith(" ") or l.startswith("+"))
+#         header = f"@@ -{old_start},{old_count} +{new_start},{new_count} {suffix}"
+#         return [header] + hunk_body
+
+#     for line in lines:
+#         if line.startswith("diff --git"):
+#             continue
+
+#         m = hunk_pattern.match(line)
+#         if m:
+#             fixed.extend(flush_hunk())
+#             hunk_body = []
+#             in_hunk = True
+#             pending_hunk = (m.group(2), m.group(5), m.group(7))
+#         elif in_hunk:
+#             if line == "":
+#                 hunk_body.append(" ")
+#             elif line[0] not in ("+", "-", " ", "\\"):
+#                 hunk_body.append(" " + line)  # force context prefix if missing
+#             else:
+#                 hunk_body.append(line)
+#         else:
+#             fixed.append(line)
+
+#     fixed.extend(flush_hunk())
+#     return "\n".join(fixed) + "\n"  # patch must end with newline
+
+# def apply_patch(patch_content: str, repo_path: str) -> dict:
+#     with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False, encoding="utf-8") as f:
+#         f.write(patch_content)
+#         patch_file = f.name
+
+#     try:
+#         check = subprocess.run(
+#             ["git", "apply", "--check", "--whitespace=fix", patch_file],
+#             cwd=repo_path, capture_output=True, text=True
+#         )
+#         if check.returncode != 0:
+#             return {"success": False, "error": check.stderr}
+
+#         result = subprocess.run(
+#             ["git", "apply", "--whitespace=fix", patch_file],
+#             cwd=repo_path, capture_output=True, text=True
+#         )
+#         return {
+#             "success": result.returncode == 0,
+#             "output": result.stdout,
+#             "error": result.stderr or None
+#         }
+#     finally:
+#         os.unlink(patch_file)
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -421,22 +614,22 @@ if __name__ == "__main__":
     ai_response = rag_pipeline.ask(user_query, generation=True)
     print(f"\n--- LLM Response ---\n{ai_response}\n")
 
-    patch = extract_patch(ai_response)
+    # patch = extract_patch(ai_response)
 
-    if patch:
-        patch = fix_patch(patch)  # auto-fix empty context lines
-        print(f"--- Extracted Patch ---\n{patch}\n")
+    # if patch:
+    #     patch = fix_patch(patch)  # auto-fix empty context lines
+    #     print(f"--- Extracted Patch ---\n{patch}\n")
 
-        validation = validate_patch(patch)
-        if not validation["valid"]:
-            print("Patch validation failed:")
-            for err in validation["errors"]:
-                print(f"  - {err}")
-        else:
-            result = apply_patch(patch, repo_path)
-            if result["success"]:
-                print("Patch applied successfully")
-            else:
-                print(f"Patch failed:\n{result['error']}")
-    else:
-        print("No patch found — model may have returned INSUFFICIENT_CONTEXT")
+    #     validation = validate_patch(patch)
+    #     if not validation["valid"]:
+    #         print("Patch validation failed:")
+    #         for err in validation["errors"]:
+    #             print(f"  - {err}")
+    #     else:
+    #         result = apply_patch(patch, repo_path)
+    #         if result["success"]:
+    #             print("Patch applied successfully")
+    #         else:
+    #             print(f"Patch failed:\n{result['error']}")
+    # else:
+    #     print("No patch found — model may have returned INSUFFICIENT_CONTEXT")
