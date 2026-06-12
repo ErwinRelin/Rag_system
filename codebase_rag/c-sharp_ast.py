@@ -21,25 +21,15 @@ import re
 import subprocess
 import tempfile
 import json
-
+import tree_sitter_c_sharp as tscsharp
+from tree_sitter import Language, Parser
 
 # ── Setup ────────────────────────────────────────────────────────────────────
-PROJECT_ROOT   = r"C:\Users\Erwin\Desktop\rag_system"
-CSHARP_GRAMMAR = os.path.join(PROJECT_ROOT, "tree-sitter-c-sharp")
-BUILD_PATH     = os.path.join(PROJECT_ROOT, "build", "csharp.dll")
 
-if os.path.exists(BUILD_PATH):
-    try:
-        os.remove(BUILD_PATH)
-    except Exception:
-        pass
 
-os.makedirs(os.path.dirname(BUILD_PATH), exist_ok=True)
-Language.build_library(BUILD_PATH, [CSHARP_GRAMMAR])
+CS_LANGUAGE = Language(tscsharp.language())
 
-CSHARP_LANGUAGE = Language(BUILD_PATH, "c_sharp")
-parser = Parser()
-parser.set_language(CSHARP_LANGUAGE)
+parser = Parser(CS_LANGUAGE)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def node_text(node, source: bytes) -> str:
@@ -75,6 +65,155 @@ def find_nodes(node, node_type):
     walk(node)
     return results
 
+def build_type_map_for_directory(dir_path):
+    """
+    Pass 1:
+    Maps instance variables to their declared types.
+
+    Example:
+        private readonly EmployeeRepository _repository;
+
+    becomes:
+
+        {
+            "_repository": "EmployeeRepository"
+        }
+    """
+
+    type_map = {}
+
+    field_pattern = (
+        r'(?:public|private|protected|internal)\s+'
+        r'(?:readonly\s+)?'
+        r'([\w<>\s]+?)\s+'
+        r'([_a-zA-Z]\w*)\s*'
+        r'(?:=[\s\S]*?)?;'
+    )
+
+    for filename in os.listdir(dir_path):
+
+        if not filename.endswith(".cs"):
+            continue
+
+        file_path = os.path.join(dir_path, filename)
+
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            source = f.read()
+
+        matches = re.findall(field_pattern, source)
+
+        for csharp_type, variable_name in matches:
+
+            type_map[variable_name.strip()] = (
+                csharp_type
+                .replace("?", "")
+                .strip()
+            )
+
+    return type_map
+
+def build_type_map_for_directory(dir_path):
+    """
+    Pass 1:
+    Maps instance variables to their declared types.
+
+    Example:
+        private readonly EmployeeRepository _repository;
+
+    becomes:
+
+        {
+            "_repository": "EmployeeRepository"
+        }
+    """
+
+    type_map = {}
+
+    field_pattern = (
+        r'(?:public|private|protected|internal)\s+'
+        r'(?:readonly\s+)?'
+        r'([\w<>\s]+?)\s+'
+        r'([_a-zA-Z]\w*)\s*'
+        r'(?:=[\s\S]*?)?;'
+    )
+
+    for filename in os.listdir(dir_path):
+
+        if not filename.endswith(".cs"):
+            continue
+
+        file_path = os.path.join(dir_path, filename)
+
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            source = f.read()
+
+        matches = re.findall(field_pattern, source)
+
+        for csharp_type, variable_name in matches:
+
+            type_map[variable_name.strip()] = (
+                csharp_type
+                .replace("?", "")
+                .strip()
+            )
+
+    return type_map
+
+def extract_method_calls(method_node, source, type_map):
+
+    calls = set()
+
+    def get_method_name(expr):
+
+        if expr is None:
+            return None
+
+        text = expr.text.decode("utf8").strip()
+
+        if "." in text:
+            return text.split(".")[-1]
+
+        return text
+
+    def walk(node):
+
+        if node.type == "invocation_expression":
+
+            function_node = node.child_by_field_name("function")
+
+            if function_node:
+
+                raw_text = function_node.text.decode("utf8").strip()
+
+                method_name = get_method_name(function_node)
+
+                if not method_name:
+                    return
+
+                if "." in raw_text:
+
+                    component = raw_text.split(".")[0]
+
+                    resolved_class = type_map.get(
+                        component,
+                        component
+                    )
+
+                    calls.add(
+                        f"{resolved_class}.{method_name}"
+                    )
+
+                else:
+
+                    calls.add(method_name)
+
+        for child in node.children:
+            walk(child)
+
+    walk(method_node)
+
+    return sorted(calls)
+
 # ── Extractors ───────────────────────────────────────────────────────────────
 def get_csharp_usings_and_block(tree, source: bytes):
     using_list = []
@@ -96,27 +235,12 @@ def get_csharp_usings_and_block(tree, source: bytes):
     if min_byte == float('inf'): return [], None
     return using_list, source[int(min_byte):int(max_byte)].decode("utf-8")
 
-def extract_method_calls(method_node, source):
-    calls = []
-
-    invocations = find_nodes(method_node, "invocation_expression")
-
-    for invocation in invocations:
-        expression = invocation.child_by_field_name("function")
-
-        if not expression:
-            continue
-
-        call_text = node_text(expression, source)
-
-        calls.append(call_text)
-
-    return calls
 # FIX #1 & #2: Removed the erroneous `for file_path in folder_path` loop.
 # `file_path` is now a plain string parameter, used directly.
-def process_csharp_class(class_node, source: bytes, file_path: str, usings=None) -> list:
+def process_csharp_class(class_node, source: bytes, file_path: str, usings=None,type_map = None) -> list:
     usings = usings or []
     method_chunks = []
+    type_map = type_map or {}
 
     name_node = get_child_by_type(class_node, "identifier")
     class_name = node_text(name_node, source) if name_node else "UnknownContainer"
@@ -134,7 +258,6 @@ def process_csharp_class(class_node, source: bytes, file_path: str, usings=None)
         "text":       class_formatted_text,
         "start_line": class_node.start_point[0] + 1,
         "end_line":   class_node.end_point[0] + 1,
-        "method_calls": extract_method_calls()
     }
 
     if class_node.type == "interface_declaration":
@@ -152,23 +275,25 @@ def process_csharp_class(class_node, source: bytes, file_path: str, usings=None)
                 method_start = child.start_point[0] + 1
                 method_end   = child.end_point[0] + 1
 
+                called_methods = extract_method_calls(child, source, type_map)
+
                 method_chunks.append({
-                    "type":        chunk_type,
-                    "class_name":  class_name,
+                    "type": chunk_type,
+                    "class_name": class_name,
                     "method_name": member_name,
-                    "language":    "c-sharp",
-                    "file_path":   file_path,
-                    "usings":      usings,
-                    "text":        format_chunk_text(
-                                       node_text(child, source),
-                                       file_path,
-                                       class_name=class_name,
-                                       method_name=member_name
-                                   ),
-                    "start_line":  method_start,
-                    "end_line":    method_end,
-                    "method_calls": extract_method_calls()
-                })
+                    "called_methods": called_methods,
+                    "language": "c-sharp",
+                    "file_path": file_path,
+                    "usings": usings,
+                    "text": format_chunk_text(
+                        node_text(child, source),
+                        file_path,
+                        class_name=class_name,
+                        method_name=member_name
+                    ),
+                    "start_line": method_start,
+                    "end_line": method_end,
+                    })
 
     # FIX #3: Always return class_chunk + method_chunks.
     # The old `if len(method_chunks) == 1: return method_chunks` dropped the
@@ -180,7 +305,10 @@ def process_csharp_class(class_node, source: bytes, file_path: str, usings=None)
 
 # FIX #4: Processes a single .cs file. The old version looped over the string
 # characters of the path and returned inside the loop (early exit on first char).
-def chunk_csharp_file(file_path: str) -> list:
+def chunk_csharp_file(file_path: str, type_map = None) -> list:
+
+    type_map = type_map or {}
+
     with open(file_path, "rb") as f:
         source = f.read()
 
@@ -198,7 +326,6 @@ def chunk_csharp_file(file_path: str) -> list:
             "usings":     usings,
             "start_line": 1,
             "end_line":   raw_using_block.count('\n') + 1,
-            "method_calls": extract_method_calls()
 
         })
 
@@ -206,7 +333,7 @@ def chunk_csharp_file(file_path: str) -> list:
     def find_code_blocks(node):
         if node.type in ("class_declaration", "interface_declaration",
                          "struct_declaration", "record_declaration"):
-            chunks.extend(process_csharp_class(node, source, file_path, usings=usings))
+            chunks.extend(process_csharp_class(node, source, file_path, usings=usings, type_map=type_map))
             return
         elif node.type in ("namespace_declaration", "file_scoped_namespace_declaration"):
             for child in node.children:
@@ -220,12 +347,30 @@ def chunk_csharp_file(file_path: str) -> list:
 
 
 # NEW: Walks a directory and chunks every .cs file found.
-def chunk_csharp_directory(dir_path: str) -> list:
+def chunk_csharp_directory(dir_path: str):
+
+    type_map = build_type_map_for_directory(
+        dir_path
+    )
+
     all_chunks = []
+
     for filename in os.listdir(dir_path):
+
         if filename.endswith(".cs"):
-            file_path = os.path.join(dir_path, filename)
-            all_chunks.extend(chunk_csharp_file(file_path))
+
+            file_path = os.path.join(
+                dir_path,
+                filename
+            )
+
+            all_chunks.extend(
+                chunk_csharp_file(
+                    file_path,
+                    type_map=type_map
+                )
+            )
+
     return all_chunks
 
 
@@ -598,7 +743,7 @@ def verify_dotnet_syntax():
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    local_llm = ChatOllama(model="qwen2.5-coder:14b")
+    local_llm = ChatOllama(model="devstral-small-2:24b")
     rag_pipeline = CodebaseRAGPipeline(llm_instance=local_llm)
 
     rag_pipeline.clear_collection()
@@ -606,9 +751,24 @@ if __name__ == "__main__":
     chunks = chunk_csharp_directory(r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\DummyApplication")
     texts    = [c["text"] for c in chunks]
     metadata = [{k: v for k, v in c.items() if k != "text"} for c in chunks]
+    print("\n========== GENERATED CHUNKS ==========\n")
+
+    for i, chunk in enumerate(chunks, start=1):
+
+        print(f"\n----- CHUNK {i} -----")
+
+        for key, value in chunk.items():
+
+            if key == "text":
+                print(f"\nTEXT:\n{value}")
+
+            else:
+                print(f"{key}: {value}")
+
+        print("\n-----------------------")
     rag_pipeline.store_chunks(texts, metadata)
 
-    user_query = "Add a method to EmployeeService that returns all employees with a configured email address."
+    user_query = "Add employee hire date support and display it in audit reports."
     repo_path = r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\DummyApplication"
 
     ai_response = rag_pipeline.ask(user_query, generation=True)
