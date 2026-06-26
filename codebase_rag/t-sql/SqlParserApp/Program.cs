@@ -2,905 +2,1074 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
-using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
+using System.Text.RegularExpressions;
 using Microsoft.SqlServer.TransactSql.ScriptDom;
-using Qdrant.Client;
-using Qdrant.Client.Grpc;
 
 namespace SqlChunkerApp
 {
-    // ── Ollama API response models ──────────────────────────────────────
-    class OllamaEmbeddingRequest
+    class StructuralSignals
     {
-        public string model { get; set; }
-        public string prompt { get; set; }
-    }
+        public string ObjectName { get; set; }
+        public string ObjectType { get; set; }
+        public string Category { get; set; }
+        public string RawSql { get; set; }
+        public string FileName { get; set; }
 
-    class OllamaEmbeddingResponse
-    {
-        public List<float> embedding { get; set; }
-    }
+        public HashSet<string> WritesTo { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> ReadsFrom { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public int IfStatementCount { get; set; }
+        public int ValidationErrorCount { get; set; }
+        public bool HasTransactionScope { get; set; }
+        public int StateColumnAssignmentCount { get; set; }
+        public List<string> Parameters { get; set; } = new();
+        public List<string> OutputParameters { get; set; } = new();
+        public Dictionary<string, HashSet<string>> ColumnsRead { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> ForeignKeyReferences { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<string> StateColumns { get; set; } = new();
+        public int DataModificationCount { get; set; }
+        public bool HasArchiveOperations { get; set; }
+        public bool WritesOnlyToAuditLog { get; set; }
+        public int TempTableCount { get; set; }
+        public bool HasDynamicSql { get; set; }
+        public bool HasSystemMetadataAccess { get; set; }
+        public bool HasCursorUsage { get; set; }
+        public int CleanupOperationCount { get; set; }
+        public bool HasBatchProcessing { get; set; }
+        public bool HasWaitForDelay { get; set; }
+        public int PrintStatementCount { get; set; }
+        public bool HasConfigOnlyParameters { get; set; }
+        public int InsertStatementCount { get; set; }
+        public int UpdateStatementCount { get; set; }
+        public int DeleteStatementCount { get; set; }
+        public int MergeStatementCount { get; set; }
+        public int SumFunctionCount { get; set; }
+        public int CountFunctionCount { get; set; }
+        public int WindowFunctionCount { get; set; }
+        public bool IsReadOnly { get; set; }
+        public int DistinctTableCount { get; set; }
+        public int SelectStatementCount { get; set; }
+        public int JoinCount { get; set; }
+        public int GroupByCount { get; set; }
+        public int AggregateFunctionCount { get; set; }
+        public int OrderByCount { get; set; }
+        public int SubqueryCount { get; set; }
+        public int CteCount { get; set; }
+        public bool HasUnionOperator { get; set; }
+        public bool HasCaseExpression { get; set; }
+        public bool HasForXmlPath { get; set; }
+        public bool HasPaginationPattern { get; set; }
+        public bool HasDateRangeFilter { get; set; }
+        public int OutputColumnCount { get; set; }
 
-    class SqlChunk
-    {
-        public int    ChunkId          { get; set; }
-        public string FileName         { get; set; }
-        public string ObjectType       { get; set; }
-        public string ChunkCategory    { get; set; }
-        public string ObjectName       { get; set; }
-        public string NlDescription    { get; set; }
-        public string References       { get; set; }
-        public string SqlText          { get; set; }
-        public string FullContextBlock { get; set; }
-        public float[] Embedding       { get; set; }
-    }
-
-    class Program
-    {
-        // ─── Configuration ───────────────────────────────────────────────
-        static string qdrantHost = "localhost";
-        static int qdrantPort = 6334;
-        static string collectionName = "sql_chunks";
-        
-        // Ollama configuration
-        static string ollamaBaseUrl = "http://localhost:11434";
-        static string embeddingModel = "nomic-embed-text";  // Good embedding model
-        // Alternative models: "mxbai-embed-large", "all-minilm", "bge-large"
-        
-        // We'll determine vector size after first embedding call
-        static int vectorSize = 768;  // Default for nomic-embed-text
-        
-        static async Task Main(string[] args)
+        public double BusinessLogicScore
         {
-            string targetFolder = @"C:\Users\Erwin\Desktop\rag_system\codebase_rag\t-sql";
-
-            if (!Directory.Exists(targetFolder))
+            get
             {
-                Console.WriteLine($"Error: Folder does not exist at '{targetFolder}'");
-                return;
+                double score = 0.0;
+                score += Math.Log(DataModificationCount + 1, 2) * 0.22;
+                score += Math.Log(IfStatementCount + 1, 2) * 0.10;
+                int clampedVals = Math.Min(ValidationErrorCount, 5);
+                score += Math.Log(clampedVals + 1, 2) * 0.12;
+                if (HasTransactionScope) score += 0.18;
+                score += Math.Log(StateColumnAssignmentCount + 1, 2) * 0.06;
+                if (OutputParameters.Count > 0) score += 0.06;
+                return Math.Min(1.0, Math.Round(score, 2));
             }
+        }
 
-            // Initialize HTTP client for Ollama
-            using var httpClient = new HttpClient 
-            { 
-                BaseAddress = new Uri(ollamaBaseUrl),
-                Timeout = TimeSpan.FromMiutes(5)
-            };
-            
-            // Verify Ollama is running and model is available
-            if (!await VerifyOllamaConnection(httpClient))
+        public double UtilityScore
+        {
+            get
             {
-                Console.WriteLine("Error: Cannot connect to Ollama. Make sure it's running.");
-                return;
+                double score = 0.0;
+                if (HasArchiveOperations) score += 0.30;
+                if (WritesOnlyToAuditLog) score += 0.20;
+                score += Math.Log(TempTableCount + 1, 2) * 0.12;
+                if (HasDynamicSql) score += 0.20;
+                if (HasSystemMetadataAccess) score += 0.15;
+                if (HasCursorUsage) score += 0.15;
+                score += Math.Log(CleanupOperationCount + 1, 2) * 0.10;
+                if (HasBatchProcessing) score += 0.15;
+                if (HasWaitForDelay) score += 0.15;
+                score += Math.Log(PrintStatementCount + 1, 2) * 0.05;
+                if (HasConfigOnlyParameters) score += 0.10;
+                return Math.Min(1.0, Math.Round(score, 2));
             }
+        }
 
-            // Get the actual vector size from the model
-            vectorSize = await GetEmbeddingSize(httpClient);
-            Console.WriteLine($"Using embedding model: {embeddingModel} (vector size: {vectorSize})");
-
-            // Initialize Qdrant client
-            var qdrantClient = new QdrantClient(qdrantHost, qdrantPort);
-            await SetupQdrantCollection(qdrantClient);
-
-            string[] sqlFiles = Directory.GetFiles(targetFolder, "*.sql");
-            Console.WriteLine($"Found {sqlFiles.Length} SQL file(s) to process.\n");
-
-            var parser = new TSql160Parser(initialQuotedIdentifiers: true);
-            var options = new SqlScriptGeneratorOptions
+        public double ReportingScore
+        {
+            get
             {
-                SqlVersion            = SqlVersion.Sql160,
-                KeywordCasing         = KeywordCasing.Uppercase,
+                double score = 0.0;
+                score += Math.Log(GroupByCount + 1, 2) * 0.10;
+                score += Math.Log(SumFunctionCount + 1, 2) * 0.08;
+                score += Math.Log(CountFunctionCount + 1, 2) * 0.06;
+                score += Math.Log(WindowFunctionCount + 1, 2) * 0.12;
+                if (IsReadOnly) score += 0.25;
+                score += Math.Log(OrderByCount + 1, 2) * 0.05;
+                if (HasPaginationPattern) score += 0.10;
+                score -= Math.Log(UpdateStatementCount + 1, 2) * 0.15;
+                score -= Math.Log(InsertStatementCount + 1, 2) * 0.12;
+                score -= Math.Log(DeleteStatementCount + 1, 2) * 0.18;
+                score -= Math.Log(MergeStatementCount + 1, 2) * 0.20;
+                if (HasTransactionScope) score -= 0.20;
+                score -= Math.Log(ValidationErrorCount + 1, 2) * 0.10;
+                score -= Math.Log(StateColumnAssignmentCount + 1, 2) * 0.08;
+                if (OutputParameters.Count > 0) score -= 0.10;
+                if (HasArchiveOperations) score -= 0.25;
+                if (HasBatchProcessing) score -= 0.15;
+                return Math.Max(-1.0, Math.Min(1.0, Math.Round(score, 2)));
+            }
+        }
+
+        /// <summary>
+        /// Primary intent — what the procedure fundamentally IS.
+        /// This IS the chunk classification. Mutually exclusive.
+        /// </summary>
+        public string ChunkClassification
+        {
+            get
+            {
+                // ── ARCHIVE ────────────────────────────────────────────
+                if (HasArchiveOperations)
+                    return "ARCHIVE";
+
+                // ── REPORT: read-only, returns data ────────────────────
+                if (IsReadOnly && (SelectStatementCount > 0 || DistinctTableCount >= 2))
+                    return "REPORT";
+
+                // ── PURGE ──────────────────────────────────────────────
+                if (CleanupOperationCount > 0 && !HasArchiveOperations 
+                    && !HasTransactionScope && DataModificationCount <= 1 
+                    && BusinessLogicScore < 0.5
+                    && !(IsReadOnly && DistinctTableCount >= 3))  // not a report with incidental cleanup
+                    return "PURGE";
+
+                // ── AUDIT ──────────────────────────────────────────────
+                if (WritesOnlyToAuditLog)
+                    return "AUDIT";
+
+                // ── LOOKUP: read-only, single-table, no aggregates ─────
+                if (IsReadOnly && DistinctTableCount == 1 && AggregateFunctionCount == 0)
+                    return "LOOKUP";
+
+                // ── CONFIG ─────────────────────────────────────────────
+                if (HasConfigOnlyParameters)
+                    return "CONFIG";
+
+                // ── BUSINESS_OPERATION ─────────────────────────────────
+                if (!IsReadOnly && DataModificationCount > 0)
+                    return "BUSINESS_OPERATION";
+
+                return "UTILITY";
+            }
+        }
+
+        /// <summary>
+        /// Secondary traits — capabilities the procedure HAS.
+        /// Multiple can apply. Used for filtering and domain attachment.
+        /// </summary>
+        public List<string> Traits
+        {
+            get
+            {
+                var traits = new List<string>();
+
+                // Domain scope
+                if (DistinctTableCount >= 4)      traits.Add("CROSS_DOMAIN");
+                else if (DistinctTableCount <= 2) traits.Add("SINGLE_DOMAIN");
+
+                // Processing patterns
+                if (HasBatchProcessing)       traits.Add("BATCH");
+                if (HasTransactionScope)      traits.Add("TRANSACTIONAL");
+                if (HasCursorUsage)           traits.Add("CURSOR");
+                if (HasWaitForDelay)          traits.Add("SCHEDULED");
+                if (TempTableCount > 0)       traits.Add("TEMP_TABLES");
+
+                // Business logic
+                if (ValidationErrorCount >= 3) traits.Add("VALIDATED");
+                if (StateColumnAssignmentCount >= 2) traits.Add("STATE_MACHINE");
+                if (OutputParameters.Count > 0) traits.Add("FACTORY");
+
+                // Query complexity
+                if (HasDynamicSql)           traits.Add("DYNAMIC_SQL");
+                if (GroupByCount > 0)        traits.Add("AGGREGATED");
+                if (HasPaginationPattern)    traits.Add("PAGINATED");
+                if (HasForXmlPath)           traits.Add("XML_AGGREGATION");
+                if (CteCount > 0)            traits.Add("CTE");
+                if (HasSystemMetadataAccess) traits.Add("METADATA");
+
+                return traits;
+            }
+        }
+
+        public string ChunkDescription
+        {
+            get
+            {
+                var sb = new System.Text.StringBuilder();
+
+                sb.Append(ChunkClassification switch
+                {
+                    "ARCHIVE"            => $"Archive — moves data to history tables",
+                    "PURGE"              => $"Purge — deletes old records without archiving",
+                    "AUDIT"              => $"Audit — logs to AuditLog without modifying business data",
+                    "LOOKUP"             => $"Lookup — simple single-table retrieval",
+                    "REPORT"             => $"Report — read-only result set across {DistinctTableCount} tables",
+                    "CONFIG"             => $"Configuration — parameter-driven setup",
+                    "BUSINESS_OPERATION" => $"Business operation — writes to [{string.Join(", ", WritesTo.Where(t => !t.Equals("AuditLog")))}]",
+                    _                    => $"Utility — general-purpose operation"
+                });
+
+                if (Traits.Any())
+                {
+                    sb.Append(". Traits: ");
+                    sb.Append(string.Join(", ", Traits.Select(t => t.ToLower().Replace("_", " "))));
+                    sb.Append(".");
+                }
+
+                return sb.ToString();
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // AST WALKER — single visitor for all ScriptDom signals
+    // ═══════════════════════════════════════════════════════════════
+
+    class StructuralSignalAstWalker : TSqlFragmentVisitor
+    {
+        public int InsertCount { get; private set; }
+        public int UpdateCount { get; private set; }
+        public int DeleteCount { get; private set; }
+        public int IfStatementCount { get; private set; }
+        public int ValidationErrorCount { get; private set; }
+        public bool HasTransactionScope { get; private set; }
+        public HashSet<string> WrittenTables { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<string> StateColumns { get; } = new();
+
+        private static readonly HashSet<string> StateColumnNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Status", "IsActive", "IsDeleted", "IsArchived", "State",
+            "ModifiedDate", "UpdatedAt", "ExpiryDate", "ClosedDate",
+            "FulfilledDate", "PaidDate", "ReturnDate", "WaivedBy", "NotificationSent"
+        };
+
+        public override void Visit(InsertStatement node)
+        {
+            InsertCount++;
+            ExtractTarget(node.InsertSpecification?.Target);
+            base.Visit(node);
+        }
+
+        public override void Visit(UpdateStatement node)
+        {
+            UpdateCount++;
+            ExtractTarget(node.UpdateSpecification?.Target);
+            if (node.UpdateSpecification?.SetClauses != null)
+            {
+                foreach (var clause in node.UpdateSpecification.SetClauses)
+                {
+                    if (clause is AssignmentSetClause assignment)
+                    {
+                        string col = assignment.Column?.MultiPartIdentifier?.Identifiers?.LastOrDefault()?.Value;
+                        if (!string.IsNullOrEmpty(col) && StateColumnNames.Contains(col))
+                            StateColumns.Add(col);
+                    }
+                }
+            }
+            base.Visit(node);
+        }
+
+        public override void Visit(DeleteStatement node)
+        {
+            DeleteCount++;
+            ExtractTarget(node.DeleteSpecification?.Target);
+            base.Visit(node);
+        }
+
+        public override void Visit(IfStatement node)
+        {
+            IfStatementCount++;
+            base.Visit(node);
+        }
+
+        public override void Visit(RaiseErrorStatement node)
+        {
+            ValidationErrorCount++;
+            base.Visit(node);
+        }
+
+        public override void Visit(ThrowStatement node)
+        {
+            ValidationErrorCount++;
+            base.Visit(node);
+        }
+
+        public override void Visit(BeginTransactionStatement node)
+        {
+            HasTransactionScope = true;
+            base.Visit(node);
+        }
+
+        private void ExtractTarget(TableReference target)
+        {
+            if (target is NamedTableReference namedTable)
+            {
+                string name = namedTable.SchemaObject?.BaseIdentifier?.Value;
+                if (!string.IsNullOrEmpty(name))
+                    WrittenTables.Add(name);
+            }
+        }
+    }
+
+    class ParameterExtractor : TSqlFragmentVisitor
+    {
+        public List<string> InputParameters { get; } = new();
+        public List<string> OutputParameters { get; } = new();
+
+        public override void Visit(CreateProcedureStatement node)
+        {
+            if (node.Parameters != null)
+            {
+                foreach (var param in node.Parameters)
+                {
+                    string name = param.VariableName?.Value ?? "";
+                    if (param.Modifier == ParameterModifier.Output || param.Modifier == ParameterModifier.ReadOnly)
+                        OutputParameters.Add(name);
+                    else
+                        InputParameters.Add(name);
+                }
+            }
+            base.Visit(node);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // MAIN PARSER ENGINE
+    // ═══════════════════════════════════════════════════════════════
+
+    class StructuralSignalParser
+    {
+        private readonly TSql160Parser _parser;
+        private readonly Sql160ScriptGenerator _generator;
+
+        private static readonly HashSet<string> Keywords = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL",
+            "AS", "ON", "SET", "INTO", "VALUES", "TOP", "DISTINCT", "ORDER", "BY",
+            "GROUP", "HAVING", "CASE", "WHEN", "THEN", "ELSE", "END", "BEGIN",
+            "TRANSACTION", "COMMIT", "ROLLBACK", "DECLARE", "EXEC", "EXECUTE",
+            "RETURN", "IF", "EXISTS", "PRINT", "CAST", "CONVERT", "ISNULL",
+            "GETDATE", "DATEADD", "DATEDIFF", "COUNT", "SUM", "AVG", "MAX", "MIN",
+            "NOCOUNT", "SCOPE_IDENTITY", "ROWCOUNT", "TRANCOUNT", "FETCH", "OPEN",
+            "CLOSE", "DEALLOCATE", "CURSOR", "NEXT", "STATUS", "DAY", "MONTH",
+            "YEAR", "LEFT", "RIGHT", "LEN", "SUBSTRING", "CONCAT", "REPLACE",
+            "LIKE", "BETWEEN", "INNER", "OUTER", "CROSS", "JOIN", "FULL",
+            "WITH", "CTE", "OUTPUT", "INSERTED", "DELETED", "DEFAULT", "IDENTITY",
+            "PRIMARY", "FOREIGN", "KEY", "REFERENCES", "CONSTRAINT", "INDEX",
+            "CREATE", "ALTER", "DROP", "TABLE", "VIEW", "PROCEDURE", "FUNCTION",
+            "TRIGGER", "DATABASE", "USE", "GO", "NVARCHAR", "VARCHAR", "INT",
+            "DECIMAL", "BIT", "DATE", "DATETIME", "FLOAT", "NCHAR", "CHAR",
+            "BIGINT", "SMALLINT", "TINYINT", "MONEY", "UNIQUEIDENTIFIER",
+            "WAITFOR", "DELAY", "WHILE", "BREAK", "CONTINUE", "TRY", "CATCH",
+            "RAISERROR", "THROW", "ERROR_MESSAGE", "ERROR_SEVERITY", "ERROR_STATE",
+            "ROW_NUMBER", "OVER", "PARTITION", "STUFF", "PATH", "XML", "FOR",
+            "SCOPE", "OBJECT", "SYS", "SYSTEM", "STRING_SPLIT", "VALUE",
+            "FAST_FORWARD", "LOCAL", "STATIC", "FORWARD_ONLY", "READ_ONLY"
+        };
+
+        public StructuralSignalParser()
+        {
+            _parser = new TSql160Parser(initialQuotedIdentifiers: true);
+            _generator = new Sql160ScriptGenerator(new SqlScriptGeneratorOptions
+            {
+                SqlVersion = SqlVersion.Sql160,
+                KeywordCasing = KeywordCasing.Uppercase,
                 NewLineBeforeFromClause = true,
                 NewLineBeforeJoinClause = true
-            };
-            var generator = new Sql160ScriptGenerator(options);
-
-            foreach (string filePath in sqlFiles)
-            {
-                string fileName = Path.GetFileName(filePath);
-                Console.WriteLine($"\n{new string('=', 60)}");
-                Console.WriteLine($"PROCESSING: {fileName}");
-                Console.WriteLine($"{new string('=', 60)}");
-
-                using var reader = new StreamReader(filePath);
-                var fragment = parser.Parse(reader, out IList<ParseError> errors);
-
-                if (errors.Count > 0)
-                {
-                    Console.WriteLine($"⚠️  Skipped '{fileName}'. Found {errors.Count} syntax error(s):");
-                    foreach (var e in errors)
-                        Console.WriteLine($"   Line {e.Line}: {e.Message}");
-                    continue;
-                }
-
-                if (fragment is not TSqlScript script) continue;
-
-                // ── Parse SQL and create chunks ──────────────────────
-                var allChunks  = new List<SqlChunk>();
-                var ddlChunks  = new List<SqlChunk>();
-                int chunkId    = 1;
-
-                foreach (TSqlBatch batch in script.Batches)
-                {
-                    foreach (TSqlStatement statement in batch.Statements)
-                    {
-                        generator.GenerateScript(statement, out string rawSql);
-                        rawSql = rawSql.Trim();
-
-                        string objectType = statement.GetType().Name;
-                        string category   = ClassifyStatement(objectType);
-                        string objectName = ExtractObjectName(statement);
-                        string references = ExtractForeignKeyReferences(statement);
-                        string nlDesc     = BuildNlDescription(statement, objectType, objectName,
-                                                               references, category, rawSql);
-
-                        var chunk = new SqlChunk
-                        {
-                            ChunkId       = chunkId++,
-                            FileName      = fileName,
-                            ObjectType    = objectType,
-                            ChunkCategory = category,
-                            ObjectName    = objectName,
-                            NlDescription = nlDesc,
-                            References    = references,
-                            SqlText       = rawSql
-                        };
-
-                        allChunks.Add(chunk);
-                        if (category is "DDL" or "VIEW" or "PROCEDURE")
-                            ddlChunks.Add(chunk);
-                    }
-                }
-
-                // Build schema summary
-                SqlChunk summaryChunk = BuildSchemaSummaryChunk(fileName, ddlChunks);
-
-                // Build full context blocks
-                foreach (var chunk in allChunks)
-                    chunk.FullContextBlock = BuildFullContextBlock(chunk);
-
-                // ── Generate embeddings with Ollama ─────────────────
-                Console.WriteLine($"Generating embeddings for {allChunks.Count + 1} chunks...");
-                
-                int processedCount = 0;
-                foreach (var chunk in allChunks.Concat(new[] { summaryChunk }))
-                {
-                    chunk.Embedding = await GenerateOllamaEmbedding(
-                        httpClient, 
-                        chunk.FullContextBlock
-                    );
-                    processedCount++;
-                    if (processedCount % 5 == 0)
-                        Console.WriteLine($"  Generated {processedCount}/{allChunks.Count + 1} embeddings");
-                }
-
-                // ── Upload to Qdrant ───────────────────────────────
-                Console.WriteLine("Uploading to Qdrant...");
-                await UploadChunksToQdrant(qdrantClient, allChunks);
-                await UploadChunksToQdrant(qdrantClient, new[] { summaryChunk });
-
-                Console.WriteLine($"✓ Completed: {fileName}");
-            }
-
-            Console.WriteLine("\nAll files processed and uploaded to Qdrant!");
-
-            // ✅ CORRECT - at the END, after everything is set up
-            await InteractiveQueryLoop(qdrantClient, httpClient);
+            });
         }
 
-        // ─────────────────────────────────────────────────────────────────
-        // Verify Ollama connection and model availability
-        // ─────────────────────────────────────────────────────────────────
-        static async Task<bool> VerifyOllamaConnection(HttpClient httpClient)
+        public List<StructuralSignals> ParseFile(string filePath)
         {
-            try
+            string fileName = Path.GetFileName(filePath);
+            var results = new List<StructuralSignals>();
+            string sqlText = File.ReadAllText(filePath);
+            var fragment = _parser.Parse(new StringReader(sqlText), out IList<ParseError> errors);
+
+            if (errors.Count > 0)
             {
-                var response = await httpClient.GetAsync("/api/tags");
-                if (!response.IsSuccessStatusCode) return false;
-                
-                var content = await response.Content.ReadAsStringAsync();
-                var models = JsonSerializer.Deserialize<JsonElement>(content);
-                
-                // Check if our model exists
-                var modelList = models.GetProperty("models").EnumerateArray();
-                bool modelExists = modelList.Any(m => 
-                    m.GetProperty("name").GetString().StartsWith(embeddingModel));
-                
-                if (!modelExists)
+                Console.WriteLine($"  Parse errors in {fileName}:");
+                foreach (var e in errors) Console.WriteLine($"     Line {e.Line}: {e.Message}");
+                return results;
+            }
+
+            if (fragment is not TSqlScript script) return results;
+
+            foreach (TSqlBatch batch in script.Batches)
+                foreach (TSqlStatement stmt in batch.Statements)
                 {
-                    Console.WriteLine($"Model '{embeddingModel}' not found. Pulling it now...");
-                    await PullOllamaModel(httpClient);
+                    var signals = ExtractSignals(stmt, fileName);
+                    if (signals != null) results.Add(signals);
                 }
-                
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Pull the embedding model if not already available
-        // ─────────────────────────────────────────────────────────────────
-        static async Task PullOllamaModel(HttpClient httpClient)
-        {
-            var payload = new { name = embeddingModel };
-            var json = JsonSerializer.Serialize(payload);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-            
-            var response = await httpClient.PostAsync("/api/pull", content);
-            var stream = await response.Content.ReadAsStreamAsync();
-            
-            using var reader = new StreamReader(stream);
-            while (!reader.EndOfStream)
-            {
-                var line = await reader.ReadLineAsync();
-                if (string.IsNullOrEmpty(line)) continue;
-                
-                var status = JsonSerializer.Deserialize<JsonElement>(line);
-                if (status.TryGetProperty("status", out var statusProp))
-                    Console.WriteLine($"  Pulling model: {statusProp.GetString()}");
-            }
-            
-            Console.WriteLine("Model pulled successfully!");
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Get the actual embedding size from the model
-        // ─────────────────────────────────────────────────────────────────
-        static async Task<int> GetEmbeddingSize(HttpClient httpClient)
-        {
-            var embedding = await GenerateOllamaEmbedding(httpClient, "test");
-            return embedding.Length;
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Generate embedding using Ollama API
-        // ─────────────────────────────────────────────────────────────────
-        static async Task<float[]> GenerateOllamaEmbedding(
-            HttpClient httpClient, 
-            string text)
-        {
-            try
-            {
-                var request = new { model = embeddingModel, prompt = text };
-                var json = JsonSerializer.Serialize(request);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                
-                var response = await httpClient.PostAsync("/api/embeddings", content);
-                response.EnsureSuccessStatusCode();
-                
-                var responseBody = await response.Content.ReadAsStringAsync();
-                var embeddingResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
-                
-                var embedding = embeddingResponse
-                    .GetProperty("embedding")
-                    .EnumerateArray()
-                    .Select(e => e.GetSingle())
-                    .ToArray();
-                
-                return embedding;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  Error generating embedding: {ex.Message}");
-                return new float[vectorSize]; // Return zero vector on error
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Setup Qdrant collection
-        // ─────────────────────────────────────────────────────────────────
-        static async Task SetupQdrantCollection(QdrantClient client)
-        {
-            try
-            {
-                var collections = await client.ListCollectionsAsync();
-                if (collections.Any(c => c == collectionName))
-                {
-                    Console.WriteLine($"Deleting existing collection '{collectionName}'...");
-                    await client.DeleteCollectionAsync(collectionName);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Warning: Could not check/delete collection: {ex.Message}");
-            }
-
-            Console.WriteLine($"Creating collection '{collectionName}' with vector size {vectorSize}...");
-            await client.CreateCollectionAsync(
-                collectionName,
-                new VectorParams { 
-                    Size = (ulong)vectorSize, 
-                    Distance = Distance.Cosine 
-                }
-            );
-
-            // Create payload indexes for filtering
-            Console.WriteLine("Creating payload indexes...");
-            await CreatePayloadIndexIfNotExists(client, "chunk_category", PayloadSchemaType.Keyword);
-            await CreatePayloadIndexIfNotExists(client, "object_type", PayloadSchemaType.Keyword);
-            await CreatePayloadIndexIfNotExists(client, "object_name", PayloadSchemaType.Keyword);
-            await CreatePayloadIndexIfNotExists(client, "file_name", PayloadSchemaType.Keyword);
-            await CreatePayloadIndexIfNotExists(client, "chunk_id", PayloadSchemaType.Integer);
-        }
-
-        static async Task CreatePayloadIndexIfNotExists(
-            QdrantClient client, 
-            string fieldName, 
-            PayloadSchemaType schemaType)
-        {
-            try
-            {
-                await client.CreatePayloadIndexAsync(
-                    collectionName, 
-                    fieldName, 
-                    schemaType
-                );
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  Note: Index on '{fieldName}' might already exist: {ex.Message}");
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Upload chunks to Qdrant
-        // ─────────────────────────────────────────────────────────────────
-        static async Task UploadChunksToQdrant(
-            QdrantClient client, 
-            IEnumerable<SqlChunk> chunks)
-        {
-            var points = new List<PointStruct>();
-            
-            foreach (var chunk in chunks)
-            {
-                ulong pointId = GeneratePointId(chunk.FileName, chunk.ChunkId);
-
-                var payload = new Dictionary<string, Value>
-                {
-                    ["file_name"] = chunk.FileName,
-                    ["chunk_id"] = chunk.ChunkId,
-                    ["chunk_category"] = chunk.ChunkCategory,
-                    ["object_type"] = chunk.ObjectType,
-                    ["object_name"] = chunk.ObjectName,
-                    ["nl_description"] = chunk.NlDescription,
-                    ["references"] = chunk.References ?? "",
-                    ["sql_text"] = chunk.SqlText,
-                    ["full_context_block"] = chunk.FullContextBlock
-                };
-
-                points.Add(new PointStruct
-                {
-                    Id = pointId,
-                    Vectors = chunk.Embedding,
-                    Payload = { payload }
-                });
-            }
-
-            // Upload in batches
-            var batchSize = 100;
-            for (int i = 0; i < points.Count; i += batchSize)
-            {
-                var batch = points.Skip(i).Take(batchSize).ToList();
-                try
-                {
-                    await client.UpsertAsync(collectionName, batch);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"  Error uploading batch: {ex.Message}");
-                }
-            }
-
-            Console.WriteLine($"  Uploaded {points.Count} chunks successfully");
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Search function for retrieval
-        // ─────────────────────────────────────────────────────────────────
-        static async Task<List<SqlChunk>> SearchSimilarChunks(
-            QdrantClient client,
-            HttpClient httpClient,
-            string query,
-            int topK = 5,
-            string? categoryFilter = null)
-        {
-            var queryEmbedding = await GenerateOllamaEmbedding(httpClient, query);
-
-            Filter? filter = null;
-            if (!string.IsNullOrEmpty(categoryFilter))
-            {
-                filter = new Filter
-                {
-                    Must = 
-                    {
-                        new Condition
-                        {
-                            Field = new FieldCondition
-                            {
-                                Key = "chunk_category",
-                                Match = new Match { Keyword = categoryFilter }
-                            }
-                        }
-                    }
-                };
-            }
-
-            var searchResult = await client.SearchAsync(
-                collectionName,
-                queryEmbedding,  // Use float[] directly, not .ToList()
-                filter,
-                limit: (ulong)topK
-            );
-
-            var results = new List<SqlChunk>();
-            foreach (var point in searchResult)
-            {
-                var payload = point.Payload;
-                results.Add(new SqlChunk
-                {
-                    FileName = payload["file_name"].StringValue,
-                    ChunkId = (int)payload["chunk_id"].IntegerValue,
-                    ChunkCategory = payload["chunk_category"].StringValue,
-                    ObjectType = payload["object_type"].StringValue,
-                    ObjectName = payload["object_name"].StringValue,
-                    NlDescription = payload["nl_description"].StringValue,
-                    References = payload["references"].StringValue,
-                    SqlText = payload["sql_text"].StringValue,
-                    FullContextBlock = payload["full_context_block"].StringValue
-                });
-            }
 
             return results;
         }
 
-        static ulong GeneratePointId(string fileName, int chunkId)
+        private StructuralSignals ExtractSignals(TSqlStatement stmt, string fileName)
         {
-            string combined = $"{fileName}_{chunkId}";
-            using var sha256 = System.Security.Cryptography.SHA256.Create();
-            var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(combined));
-            return BitConverter.ToUInt64(hashBytes, 0);
+            _generator.GenerateScript(stmt, out string rawSql);
+            rawSql = rawSql.Trim();
+            if (string.IsNullOrWhiteSpace(rawSql)) return null;
+
+            var signals = new StructuralSignals
+            {
+                ObjectName = ExtractObjectName(stmt),
+                ObjectType = stmt.GetType().Name,
+                Category = ClassifyStatement(stmt.GetType().Name),
+                RawSql = rawSql,
+                FileName = fileName
+            };
+
+            // ── Single AST walk ────────────────────────────────────
+            var walker = new StructuralSignalAstWalker();
+            stmt.Accept(walker);
+
+            signals.InsertStatementCount = walker.InsertCount;
+            signals.UpdateStatementCount = walker.UpdateCount;
+            signals.DeleteStatementCount = walker.DeleteCount;
+            signals.HasTransactionScope = walker.HasTransactionScope;
+
+            signals.WritesTo = new HashSet<string>(
+                walker.WrittenTables.Where(t => !IsKeyword(t)),
+                StringComparer.OrdinalIgnoreCase);
+
+            signals.DataModificationCount = walker.WrittenTables
+                .Count(t => !IsKeyword(t) && !t.StartsWith("#")
+                    && !t.EndsWith("_Archive")
+                    && !t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase)
+                    && t.Length > 3);
+
+            signals.StateColumns = walker.StateColumns
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            signals.StateColumnAssignmentCount = signals.StateColumns.Count;
+
+            // ── Regex-based extractions ────────────────────────────
+            ExtractReadDependencies(rawSql, signals);
+            signals.IfStatementCount = CountBusinessIfStatements(rawSql);
+            signals.ValidationErrorCount = CountBusinessValidations(rawSql);
+            ExtractUtilitySignals(rawSql, signals);
+            ExtractReportingSignals(rawSql, signals);
+
+            signals.WritesOnlyToAuditLog = signals.WritesTo.Count == 1
+                && signals.WritesTo.Contains("AuditLog");
+            signals.HasConfigOnlyParameters = signals.Parameters.Count > 0
+                && signals.Parameters.All(p =>
+                    p.Contains("BatchSize") || p.Contains("Retention")
+                    || p.Contains("Simulate") || p.Contains("Threshold")
+                    || p.Contains("Audit"));
+            signals.IsReadOnly = signals.WritesTo.Count == 0
+                || (signals.WritesTo.Count == 1 && signals.WritesTo.Contains("AuditLog"));
+            signals.DistinctTableCount = signals.ReadsFrom
+                .Count(t => !IsKeyword(t) && !t.StartsWith("#") && !t.EndsWith("_cursor"));
+
+            ExtractParameters(stmt, signals);
+            ExtractForeignKeyReferences(stmt, signals);
+
+            return signals;
         }
 
-        // ── Your existing helper methods ────────────────────────────────
-        // ── Your existing helper methods ────────────────────────────────
-        static string ClassifyStatement(string objectType) => objectType switch
+        private void ExtractReadDependencies(string rawSql, StructuralSignals signals)
         {
-            "CreateTableStatement"     => "DDL",
-            "CreateDatabaseStatement"  => "DDL",
-            "UseStatement"             => "DDL",
-            "AlterTableStatement"      => "DDL",
-            "CreateIndexStatement"     => "DDL",
-            "CreateViewStatement"      => "VIEW",
-            "CreateProcedureStatement" => "PROCEDURE",
-            "CreateFunctionStatement"  => "PROCEDURE",
-            "InsertStatement"          => "SEED_DATA",
-            "UpdateStatement"          => "DML",
-            "DeleteStatement"          => "DML",
-            "SelectStatement"          => "DML",
-            _                          => "OTHER"
-        };
+            var aliasMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Match m in Regex.Matches(rawSql,
+                @"\b(?:FROM|JOIN)\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?",
+                RegexOptions.IgnoreCase))
+            {
+                string realTable = m.Groups[1].Value;
+                string alias = m.Groups[2].Success ? m.Groups[2].Value : realTable;
+                if (!IsKeyword(realTable) && !IsKeyword(alias))
+                    aliasMap[alias] = realTable;
+            }
 
-        static string ExtractObjectName(TSqlStatement stmt) => stmt switch
+            var readPatterns = new[]
+            {
+                @"\bFROM\s+(\w+)(?:\s+(?:AS\s+)?\w+)?",
+                @"\b(?:INNER|LEFT|RIGHT|FULL|CROSS)?\s*(?:OUTER\s+)?JOIN\s+(\w+)",
+                @"\bEXISTS\s*\(\s*SELECT\s+\d\s+FROM\s+(\w+)"
+            };
+
+            foreach (var pattern in readPatterns)
+                foreach (Match m in Regex.Matches(rawSql, pattern, RegexOptions.IgnoreCase))
+                {
+                    string table = aliasMap.TryGetValue(m.Groups[1].Value, out string real) ? real : m.Groups[1].Value;
+                    if (!IsKeyword(table)) signals.ReadsFrom.Add(table);
+                }
+
+            foreach (Match m in Regex.Matches(rawSql, @"\b(\w+)\.(\w+)\b", RegexOptions.IgnoreCase))
+            {
+                string aliasOrTable = m.Groups[1].Value, column = m.Groups[2].Value;
+                if (IsKeyword(aliasOrTable) || IsKeyword(column)) continue;
+                if (Regex.IsMatch(aliasOrTable, @"^\d") || Regex.IsMatch(column, @"^\d")) continue;
+                string table = aliasMap.TryGetValue(aliasOrTable, out string resolved) ? resolved : aliasOrTable;
+                if (!signals.ColumnsRead.ContainsKey(table))
+                    signals.ColumnsRead[table] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                signals.ColumnsRead[table].Add(column);
+            }
+        }
+
+        private static int CountBusinessIfStatements(string rawSql)
         {
-            CreateTableStatement     s => s.SchemaObjectName?.BaseIdentifier?.Value ?? "",
-            CreateViewStatement      s => s.SchemaObjectName?.BaseIdentifier?.Value ?? "",
-            CreateProcedureStatement s => s.ProcedureReference?.Name?.BaseIdentifier?.Value ?? "",
-            CreateFunctionStatement  s => s.Name?.BaseIdentifier?.Value ?? "",
-            CreateDatabaseStatement  s => s.DatabaseName?.Value ?? "",
-            _                          => ""
-        };
+            var boilerplatePatterns = new[]
+            {
+                @"IF\s+@@TRANCOUNT\s*>\s*0",
+                @"IF\s+@@ERROR\s*<>\s*0",
+                @"IF\s+@@FETCH_STATUS",
+                @"IF\s+@\w+\s+IS\s+NULL\s*\n\s*BEGIN\s*\n\s*RAISERROR\s*\(\s*'[^']*not\s+found",
+            };
+            int totalIfs = 0, boilerplateIfs = 0;
+            foreach (Match m in Regex.Matches(rawSql, @"\bIF\b", RegexOptions.IgnoreCase))
+            {
+                totalIfs++;
+                string remaining = rawSql.Substring(m.Index, Math.Min(200, rawSql.Length - m.Index));
+                foreach (var pattern in boilerplatePatterns)
+                    if (Regex.IsMatch(remaining, pattern, RegexOptions.IgnoreCase | RegexOptions.Singleline))
+                    { boilerplateIfs++; break; }
+            }
+            return totalIfs - boilerplateIfs;
+        }
 
-        static string ExtractForeignKeyReferences(TSqlStatement stmt)
+        private static int CountBusinessValidations(string rawSql)
         {
-            if (stmt is not CreateTableStatement createTable) return "";
+            string withoutCatch = Regex.Replace(rawSql, @"BEGIN\s+CATCH.*?END\s+CATCH", "",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            return Regex.Matches(withoutCatch, @"\bRAISERROR\b", RegexOptions.IgnoreCase).Count
+                 + Regex.Matches(withoutCatch, @"\bTHROW\b", RegexOptions.IgnoreCase).Count;
+        }
 
-            var refs = new List<string>();
+        private static void ExtractUtilitySignals(string rawSql, StructuralSignals signals)
+        {
+            signals.HasArchiveOperations = Regex.IsMatch(rawSql,
+                @"\b(?:INSERT\s+INTO|DELETE\s+FROM|UPDATE)\s+\w+_Archive\b", RegexOptions.IgnoreCase);
+            signals.TempTableCount = Regex.Matches(rawSql, @"\bCREATE\s+TABLE\s+#\w+", RegexOptions.IgnoreCase).Count;
+            signals.HasDynamicSql = Regex.IsMatch(rawSql, @"\b(?:EXEC\s*\(\s*@|sp_executesql)", RegexOptions.IgnoreCase);
+            signals.HasSystemMetadataAccess = Regex.IsMatch(rawSql,
+                @"\b(?:sys\.(?:tables|columns|objects|schemas|databases|indexes|views|procedures)|INFORMATION_SCHEMA\.)", RegexOptions.IgnoreCase);
+            signals.HasCursorUsage = Regex.IsMatch(rawSql, @"\bDECLARE\s+\w+\s+CURSOR\b", RegexOptions.IgnoreCase);
+            signals.CleanupOperationCount = Regex.Matches(rawSql,
+                @"\b(?:DELETE\s+(?:TOP\s*\(.*?\)\s*)?(?:FROM\s+)?\w+|DROP\s+TABLE\s+|TRUNCATE\s+TABLE\s+)", RegexOptions.IgnoreCase).Count;
+            signals.HasBatchProcessing = Regex.IsMatch(rawSql,
+                @"\b(?:TOP\s*\(\s*@BatchSize\s*\)|@@ROWCOUNT|WHILE\s+@RowCount\s*[<>=])", RegexOptions.IgnoreCase);
+            signals.HasWaitForDelay = Regex.IsMatch(rawSql, @"\bWAITFOR\s+DELAY\b", RegexOptions.IgnoreCase);
+            signals.PrintStatementCount = Regex.Matches(rawSql, @"\bPRINT\s+", RegexOptions.IgnoreCase).Count;
+        }
+
+        private static void ExtractReportingSignals(string rawSql, StructuralSignals signals)
+        {
+            string cleaned = Regex.Replace(rawSql, @"INSERT\s+INTO.*?SELECT\s+", "",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+
+            signals.SelectStatementCount = Regex.Matches(cleaned,
+                @"\bSELECT\s+(?!@)\w+",
+                RegexOptions.IgnoreCase).Count;
+            signals.JoinCount = Regex.Matches(cleaned,
+                @"\b(?:INNER|LEFT|RIGHT|FULL|CROSS)?\s*(?:OUTER\s+)?JOIN\b", RegexOptions.IgnoreCase).Count;
+            signals.GroupByCount = Regex.Matches(cleaned, @"\bGROUP\s+BY\b", RegexOptions.IgnoreCase).Count;
+            signals.AggregateFunctionCount = Regex.Matches(cleaned,
+                @"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", RegexOptions.IgnoreCase).Count;
+            signals.OrderByCount = Regex.Matches(cleaned, @"\bORDER\s+BY\b", RegexOptions.IgnoreCase).Count;
+            signals.SubqueryCount = Regex.Matches(cleaned, @"\(\s*SELECT\s+(?!1\b)\w+", RegexOptions.IgnoreCase).Count;
+            signals.CteCount = Regex.Matches(rawSql, @"\bWITH\s+\w+\s+AS\s*\(", RegexOptions.IgnoreCase).Count;
+            signals.HasUnionOperator = Regex.IsMatch(rawSql, @"\bUNION\s+(?:ALL\s+)?\b", RegexOptions.IgnoreCase);
+            signals.HasCaseExpression = Regex.IsMatch(rawSql, @"\bCASE\s+(?:WHEN|@)", RegexOptions.IgnoreCase);
+            signals.HasForXmlPath = Regex.IsMatch(rawSql, @"\bFOR\s+XML\s+PATH\b", RegexOptions.IgnoreCase);
+            signals.HasPaginationPattern = Regex.IsMatch(rawSql,
+                @"\b(?:TOP\s*\(|ROW_NUMBER\s*\(\s*\)\s+OVER|OFFSET\s+\d+\s+ROWS)", RegexOptions.IgnoreCase);
+            signals.HasDateRangeFilter = Regex.IsMatch(rawSql,
+                @"\b(?:BETWEEN\s+@\w+\s+AND\s+@\w+|DATEADD\s*\(.*GETDATE)", RegexOptions.IgnoreCase);
+            signals.SumFunctionCount = Regex.Matches(rawSql, @"\bSUM\s*\(", RegexOptions.IgnoreCase).Count;
+            signals.CountFunctionCount = Regex.Matches(rawSql, @"\bCOUNT\s*\(", RegexOptions.IgnoreCase).Count;
+            signals.WindowFunctionCount = Regex.Matches(rawSql,
+                @"\b(?:ROW_NUMBER|RANK|DENSE_RANK|NTILE|LAG|LEAD|FIRST_VALUE|LAST_VALUE)\s*\(", RegexOptions.IgnoreCase).Count;
+            signals.MergeStatementCount = Regex.Matches(rawSql, @"\bMERGE\s+", RegexOptions.IgnoreCase).Count;
+
+            var selectMatches = Regex.Matches(cleaned, @"\bSELECT\s+(?!@)(?!1\b)(.*?)\bFROM\b",
+                RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            int totalCols = 0;
+            foreach (Match sm in selectMatches)
+                totalCols += sm.Groups[1].Value.Count(c => c == ',') + 1;
+            signals.OutputColumnCount = totalCols;
+        }
+
+        private void ExtractParameters(TSqlStatement stmt, StructuralSignals signals)
+        {
+            var extractor = new ParameterExtractor();
+            stmt.Accept(extractor);
+            signals.Parameters = extractor.InputParameters;
+            signals.OutputParameters = extractor.OutputParameters;
+        }
+
+        private void ExtractForeignKeyReferences(TSqlStatement stmt, StructuralSignals signals)
+        {
+            if (stmt is not CreateTableStatement createTable) return;
             foreach (var constraint in createTable.Definition.TableConstraints)
-            {
                 if (constraint is ForeignKeyConstraintDefinition fk)
-                {
-                    string refTable = fk.ReferenceTableName?.BaseIdentifier?.Value;
-                    if (!string.IsNullOrEmpty(refTable))
-                        refs.Add(refTable);
-                }
-            }
-
+                { var t = fk.ReferenceTableName?.BaseIdentifier?.Value; if (!string.IsNullOrEmpty(t)) { signals.ForeignKeyReferences.Add(t); signals.ReadsFrom.Add(t); } }
             foreach (var col in createTable.Definition.ColumnDefinitions)
-            {
                 foreach (var constraint in col.Constraints)
-                {
                     if (constraint is ForeignKeyConstraintDefinition fk)
+                    { var t = fk.ReferenceTableName?.BaseIdentifier?.Value; if (!string.IsNullOrEmpty(t)) { signals.ForeignKeyReferences.Add(t); signals.ReadsFrom.Add(t); } }
+        }
+
+        private static string ClassifyStatement(string objectType) => objectType switch
+        {
+            "CreateTableStatement" => "DDL", "CreateDatabaseStatement" => "DDL",
+            "UseStatement" => "DDL", "AlterTableStatement" => "DDL",
+            "CreateIndexStatement" => "DDL", "CreateViewStatement" => "VIEW",
+            "CreateProcedureStatement" => "PROCEDURE", "CreateFunctionStatement" => "PROCEDURE",
+            "InsertStatement" => "SEED_DATA", "UpdateStatement" => "DML",
+            "DeleteStatement" => "DML", "SelectStatement" => "DML", _ => "OTHER"
+        };
+
+        private static string ExtractObjectName(TSqlStatement stmt) => stmt switch
+        {
+            CreateTableStatement s => s.SchemaObjectName?.BaseIdentifier?.Value ?? "",
+            CreateViewStatement s => s.SchemaObjectName?.BaseIdentifier?.Value ?? "",
+            CreateProcedureStatement s => s.ProcedureReference?.Name?.BaseIdentifier?.Value ?? "",
+            CreateFunctionStatement s => s.Name?.BaseIdentifier?.Value ?? "",
+            CreateDatabaseStatement s => s.DatabaseName?.Value ?? "", _ => ""
+        };
+
+        private static bool IsKeyword(string token) =>
+            Keywords.Contains(token) || Regex.IsMatch(token, @"^\d")
+            || token.StartsWith("#") || token.EndsWith("_cursor");
+    }
+
+    class BusinessDomain
+    {
+        public string DomainName { get; set; }
+        public string BusinessFlow { get; set; }
+        public HashSet<string> OwnedTables { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<StructuralSignals> Procedures { get; set; } = new();
+        public HashSet<string> AllReadTables { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> AllWriteTables { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    class BusinessCapabilityDiscoverer
+    {
+        // ── Business capability taxonomy ──────────────────────────
+        private static readonly Dictionary<string, string[]> CapabilityVerbs = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["MemberManagement"] = new[] { "Member", "Membership" },
+            ["Lending"]          = new[] { "Loan", "Issue", "Return", "Renew", "Reserve", "Borrow" },
+            ["FineManagement"]   = new[] { "Fine", "Pay", "Waive", "Penalty", "Overdue" },
+            ["CatalogManagement"] = new[] { "Book", "Author", "Publisher", "Category", "Catalog", "ISBN", "Title" },
+            ["EmployeeManagement"] = new[] { "Employee", "Hire", "Staff", "Terminate" },
+            ["LeaveManagement"]  = new[] { "Leave", "Vacation", "Sick", "TimeOff" },
+            ["AttendanceTracking"] = new[] { "Attendance", "TimeIn", "TimeOut", "Clock" },
+            ["PayrollProcessing"] = new[] { "Payroll", "Salary", "Pay", "Compensation" },
+            ["PerformanceManagement"] = new[] { "Performance", "Review", "Appraisal", "Rating" },
+            ["TrainingDevelopment"] = new[] { "Training", "Enroll", "Course", "Certification" },
+            ["RecruitmentHiring"] = new[] { "Recruit", "Candidate", "Requisition", "Hire", "Job" },
+        };
+
+        // ── Entity lifecycle stages ───────────────────────────────
+        private static readonly Dictionary<string, string[]> LifecycleStages = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Member"]   = new[] { "Add", "Register", "Activate", "Renew", "Expire", "Deactivate", "Terminate" },
+            ["Loan"]     = new[] { "Issue", "Checkout", "Renew", "Return", "Close", "Overdue" },
+            ["Fine"]     = new[] { "Assess", "Pay", "Waive", "Appeal", "WriteOff" },
+            ["Employee"] = new[] { "Add", "Hire", "Onboard", "Promote", "Transfer", "Terminate", "Exit" },
+            ["Leave"]    = new[] { "Submit", "Approve", "Reject", "Cancel", "Take" },
+            ["Payroll"]  = new[] { "Calculate", "Process", "Approve", "Distribute", "Close" },
+        };
+
+        /// <summary>
+        /// Discovers business capabilities from procedure names, state patterns,
+        /// and workflow chains — not from table co-occurrence.
+        /// </summary>
+        public Dictionary<string, BusinessCapability> DiscoverCapabilities(List<StructuralSignals> procs)
+        {
+            var capabilities = new Dictionary<string, BusinessCapability>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var proc in procs)
+            {
+                // Step 1: Extract business nouns and verbs from procedure name
+                var (nouns, verbs) = ParseProcedureName(proc.ObjectName);
+
+                // Step 2: Match to known business capabilities
+                string capability = MatchCapability(proc, nouns, verbs);
+
+                // Step 3: Determine lifecycle stage
+                string stage = MatchLifecycleStage(proc, nouns, verbs);
+
+                // Step 4: Find workflow neighbors (procs that share reads/writes)
+                var neighbors = FindWorkflowNeighbors(proc, procs);
+
+                if (!capabilities.ContainsKey(capability))
+                {
+                    capabilities[capability] = new BusinessCapability
                     {
-                        string refTable = fk.ReferenceTableName?.BaseIdentifier?.Value;
-                        if (!string.IsNullOrEmpty(refTable))
-                            refs.Add(refTable);
-                    }
+                        CapabilityName = capability,
+                        LifecycleStages = new List<string>(),
+                        Procedures = new List<StructuralSignals>(),
+                        CoreEntities = new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+                        WorkflowEdges = new List<(string from, string to)>(),
+                    };
                 }
-            }
 
-            return string.Join(", ", refs.Distinct());
-        }
+                var cap = capabilities[capability];
+                cap.Procedures.Add(proc);
+                cap.CoreEntities.UnionWith(nouns);
+                if (!cap.LifecycleStages.Contains(stage))
+                    cap.LifecycleStages.Add(stage);
 
-        static string BuildNlDescription(TSqlStatement stmt, string objectType,
-                                        string objectName, string references,
-                                        string category, string rawSql)
-        {
-            if (category == "SEED_DATA")
-                return $"Sample / seed data INSERT — not schema definition. " +
-                    $"Exclude this chunk when only schema context is needed.";
-
-            if (category == "DDL" && objectType == "CreateDatabaseStatement")
-                return $"Creates the top-level database named '{objectName}'.";
-
-            if (category == "DDL" && objectType == "UseStatement")
-                return "Switches the active database context.";
-
-            if (stmt is CreateTableStatement createTable)
-            {
-                var cols = createTable.Definition.ColumnDefinitions
-                                        .Select(c => c.ColumnIdentifier.Value).ToList();
-                string fkNote = string.IsNullOrEmpty(references)
-                    ? "No foreign-key dependencies."
-                    : $"References: {references}.";
-                return $"Defines the '{objectName}' table with columns: {string.Join(", ", cols)}. {fkNote}";
-            }
-
-            if (stmt is CreateViewStatement)
-                return $"View '{objectName}' — a pre-built SELECT that joins multiple tables " +
-                    $"and can be queried directly without rewriting the join logic.";
-
-            if (stmt is CreateProcedureStatement)
-                return $"Stored procedure '{objectName}' — encapsulates business logic that " +
-                    $"can be called by name; inspect the body for parameters and DML operations.";
-
-            return $"{objectType} statement on object '{objectName}'.";
-        }
-
-        static SqlChunk BuildSchemaSummaryChunk(string fileName, List<SqlChunk> ddlChunks)
-        {
-            var sb = new StringBuilder();
-            sb.AppendLine("=== SCHEMA SUMMARY ===");
-            sb.AppendLine($"File: {fileName}");
-            sb.AppendLine();
-
-            var tables = ddlChunks.Where(c => c.ObjectType == "CreateTableStatement").ToList();
-            var views  = ddlChunks.Where(c => c.ObjectType == "CreateViewStatement").ToList();
-            var procs  = ddlChunks.Where(c => c.ObjectType == "CreateProcedureStatement").ToList();
-
-            if (tables.Any())
-            {
-                sb.AppendLine("TABLES:");
-                foreach (var t in tables)
+                foreach (var neighbor in neighbors)
                 {
-                    sb.AppendLine($"  • {t.ObjectName}");
-                    sb.AppendLine($"    {t.NlDescription}");
-                    if (!string.IsNullOrEmpty(t.References))
-                        sb.AppendLine($"    FK → {t.References}");
+                    cap.WorkflowEdges.Add((proc.ObjectName, neighbor.ObjectName));
                 }
-                sb.AppendLine();
             }
 
-            if (views.Any())
+            // Step 5: Order lifecycle stages
+            foreach (var cap in capabilities.Values)
             {
-                sb.AppendLine("VIEWS:");
-                foreach (var v in views)
-                    sb.AppendLine($"  • {v.ObjectName}: {v.NlDescription}");
-                sb.AppendLine();
+                cap.LifecycleOrder = OrderLifecycleStages(cap.LifecycleStages);
             }
 
-            if (procs.Any())
-            {
-                sb.AppendLine("STORED PROCEDURES:");
-                foreach (var p in procs)
-                    sb.AppendLine($"  • {p.ObjectName}: {p.NlDescription}");
-                sb.AppendLine();
-            }
-
-            sb.AppendLine("RELATIONSHIP MAP (table → its FK targets):");
-            foreach (var t in tables.Where(t => !string.IsNullOrEmpty(t.References)))
-                sb.AppendLine($"  {t.ObjectName} → {t.References}");
-
-            string summaryText = sb.ToString().Trim();
-
-            return new SqlChunk
-            {
-                ChunkId          = 0,
-                FileName         = fileName,
-                ObjectType       = "SchemaSummary",
-                ChunkCategory    = "SCHEMA_SUMMARY",
-                ObjectName       = fileName,
-                NlDescription    = "High-level overview of every table, view, and procedure in this file, including FK relationships. Always include this chunk in LLM context.",
-                References       = "",
-                SqlText          = summaryText,
-                FullContextBlock = summaryText
-            };
+            return capabilities;
         }
 
-        static string BuildFullContextBlock(SqlChunk chunk)
+        private (List<string> nouns, List<string> verbs) ParseProcedureName(string procName)
         {
-            var sb = new StringBuilder();
-            sb.AppendLine($"[CHUNK]");
-            sb.AppendLine($"  File     : {chunk.FileName}");
-            sb.AppendLine($"  Id       : {chunk.ChunkId}");
-            sb.AppendLine($"  Category : {chunk.ChunkCategory}");
-            sb.AppendLine($"  Object   : {chunk.ObjectName}");
-
-            if (!string.IsNullOrEmpty(chunk.References))
-                sb.AppendLine($"  FK Refs  : {chunk.References}");
-
-            sb.AppendLine($"  Summary  : {chunk.NlDescription}");
-            sb.AppendLine();
-            sb.AppendLine("[SQL]");
-            sb.AppendLine(chunk.SqlText);
-            sb.AppendLine("[/SQL]");
-
-            return sb.ToString().Trim();
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Ollama chat models
-        // ─────────────────────────────────────────────────────────────────
-        class OllamaChatRequest
-        {
-            public string model { get; set; }
-            public List<OllamaMessage> messages { get; set; }
-            public bool stream { get; set; }
-            public OllamaOptions options { get; set; }
-        }
-
-        class OllamaMessage
-        {
-            public string role { get; set; }  // "system", "user", "assistant"
-            public string content { get; set; }
-        }
-
-        class OllamaOptions
-        {
-            public float temperature { get; set; }
-            public int num_predict { get; set; }
-        }
-
-        class OllamaChatResponse
-        {
-            public string model { get; set; }
-            public OllamaMessage message { get; set; }
-            public bool done { get; set; }
-        }
-
-        // Add these fields to your configuration section
-        static string chatModel = "qwen2.5-custom:latest";  // or "mistral", "codellama", etc.
-        static int maxTokens = 2048;
-        static float temperature = 0.7f;
-
-        // ─────────────────────────────────────────────────────────────────
-        // RAG Pipeline: Search → Augment → Generate
-        // ─────────────────────────────────────────────────────────────────
-        static async Task<string> QueryWithContext(
-            QdrantClient qdrantClient,
-            HttpClient ollamaClient,
-            string userQuery,
-            int chunksToRetrieve = 5)
-        {
-            Console.WriteLine($"\n{new string('=', 60)}");
-            Console.WriteLine($"QUERY: {userQuery}");
-            Console.WriteLine($"{new string('=', 60)}\n");
-
-            // Step 1: Search for relevant chunks
-            Console.WriteLine("Searching for relevant SQL context...");
-            var relevantChunks = await SearchSimilarChunks(
-                qdrantClient, 
-                ollamaClient, 
-                userQuery, 
-                topK: chunksToRetrieve
-            );
-
-            Console.WriteLine($"Found {relevantChunks.Count} relevant chunks\n");
-
-            // Step 2: Build context from retrieved chunks
-            var contextBuilder = new StringBuilder();
-            contextBuilder.AppendLine("Here are the relevant SQL schema and code chunks:\n");
+            // sp_AddNewEmployee → nouns: [Employee], verbs: [Add]
+            // sp_SubmitLeaveRequest → nouns: [Leave, Request], verbs: [Submit]
+            // sp_ProcessOverdueBooks → nouns: [Book], verbs: [Process]
             
-            for (int i = 0; i < relevantChunks.Count; i++)
-            {
-                var chunk = relevantChunks[i];
-                contextBuilder.AppendLine($"--- Chunk {i + 1} ---");
-                contextBuilder.AppendLine($"Type: {chunk.ObjectType}");
-                contextBuilder.AppendLine($"Category: {chunk.ChunkCategory}");
-                contextBuilder.AppendLine($"Name: {chunk.ObjectName}");
-                contextBuilder.AppendLine($"Description: {chunk.NlDescription}");
-                if (!string.IsNullOrEmpty(chunk.References))
-                    contextBuilder.AppendLine($"References: {chunk.References}");
-                contextBuilder.AppendLine();
-                contextBuilder.AppendLine("SQL Code:");
-                contextBuilder.AppendLine(chunk.SqlText);
-                contextBuilder.AppendLine();
-            }
-
-            string context = contextBuilder.ToString();
-
-            // Step 3: Build the prompt with context
-            var systemPrompt = @"You are a SQL expert assistant. You have access to the database schema 
-        and SQL code chunks provided in the context. Use this context to answer questions accurately.
-
-        Guidelines:
-        - Always reference the specific tables, views, or procedures from the context
-        - If the context doesn't contain enough information, say so
-        - Explain your reasoning when suggesting SQL queries
-        - Include relevant schema details in your answers
-        - Format SQL code with proper indentation and syntax highlighting using markdown";
-
-            var userPrompt = $@"Context from the database:
-        {context}
-
-        User Question: {userQuery}
-
-        Please provide a detailed answer based on the context above. If you need to write SQL, 
-        make sure it aligns with the schema provided.""";
+            string name = procName.Replace("sp_", "").Replace("_", "");
             
-            // Step 4: Send to Ollama LLM
-            Console.WriteLine("Generating response with Ollama...\n");
-            var response = await ChatWithOllama(
-                ollamaClient, 
-                systemPrompt, 
-                userPrompt
-            );
+            var nouns = new List<string>();
+            var verbs = new List<string>();
 
-            return response;
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Chat with Ollama (non-streaming)
-        // ─────────────────────────────────────────────────────────────────
-        static async Task<string> ChatWithOllama(
-            HttpClient httpClient,
-            string systemPrompt,
-            string userPrompt)
-        {
-            var request = new OllamaChatRequest
+            // Known verbs
+            foreach (var verb in new[] { "Add", "Create", "Submit", "Approve", "Reject", 
+                "Process", "Generate", "Get", "Search", "Update", "Delete", "Terminate",
+                "Issue", "Return", "Renew", "Reserve", "Pay", "Waive", "Transfer",
+                "Record", "Enroll", "Bulk", "Calculate" })
             {
-                model = chatModel,
-                stream = false,
-                options = new OllamaOptions
+                if (name.StartsWith(verb, StringComparison.OrdinalIgnoreCase))
                 {
-                    temperature = temperature,
-                    num_predict = maxTokens
-                },
-                messages = new List<OllamaMessage>
-                {
-                    new OllamaMessage { role = "system", content = systemPrompt },
-                    new OllamaMessage { role = "user", content = userPrompt }
-                }
-            };
-
-            try
-            {
-                var json = JsonSerializer.Serialize(request, new JsonSerializerOptions 
-                { 
-                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase 
-                });
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                
-                var response = await httpClient.PostAsync("/api/chat", content);
-                response.EnsureSuccessStatusCode();
-                
-                var responseBody = await response.Content.ReadAsStringAsync();
-                var chatResponse = JsonSerializer.Deserialize<OllamaChatResponse>(
-                    responseBody, 
-                    new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }
-                );
-                
-                return chatResponse?.message?.content ?? "No response generated";
-            }
-            catch (Exception ex)
-            {
-                return $"Error calling Ollama: {ex.Message}";
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Streaming chat with Ollama (for real-time responses)
-        // ─────────────────────────────────────────────────────────────────
-        static async Task ChatWithOllamaStreaming(
-            HttpClient httpClient,
-            string systemPrompt,
-            string userPrompt)
-        {
-            var request = new OllamaChatRequest
-            {
-                model = chatModel,
-                stream = true,
-                options = new OllamaOptions
-                {
-                    temperature = temperature,
-                    num_predict = maxTokens
-                },
-                messages = new List<OllamaMessage>
-                {
-                    new OllamaMessage { role = "system", content = systemPrompt },
-                    new OllamaMessage { role = "user", content = userPrompt }
-                }
-            };
-
-            try
-            {
-                var json = JsonSerializer.Serialize(request, new JsonSerializerOptions 
-                { 
-                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase 
-                });
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                
-                var response = await httpClient.PostAsync("/api/chat", content);
-                response.EnsureSuccessStatusCode();
-                
-                var stream = await response.Content.ReadAsStreamAsync();
-                using var reader = new StreamReader(stream);
-                
-                Console.WriteLine("AI Response:\n");
-                
-                while (!reader.EndOfStream)
-                {
-                    var line = await reader.ReadLineAsync();
-                    if (string.IsNullOrEmpty(line)) continue;
-                    
-                    try
-                    {
-                        var chunk = JsonSerializer.Deserialize<JsonElement>(line);
-                        if (chunk.TryGetProperty("message", out var message) &&
-                            message.TryGetProperty("content", out var messageContent))
-                        {
-                            Console.Write(messageContent.GetString());
-                        }
-                    }
-                    catch (JsonException)
-                    {
-                        // Skip malformed JSON chunks
-                        continue;
-                    }
-                }
-                
-                Console.WriteLine("\n");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error in streaming chat: {ex.Message}");
-            }
-        }
-
-        // ─────────────────────────────────────────────────────────────────
-        // Interactive query loop
-        // ─────────────────────────────────────────────────────────────────
-        static async Task InteractiveQueryLoop(
-            QdrantClient qdrantClient,
-            HttpClient ollamaClient)
-        {
-            Console.WriteLine("\nEntering interactive query mode (type 'exit' to quit):\n");
-            
-            while (true)
-            {
-                Console.Write("🔍 Your question: ");
-                string query = Console.ReadLine();
-                
-                if (string.IsNullOrWhiteSpace(query) || query.ToLower() == "exit")
+                    verbs.Add(verb);
+                    name = name.Substring(verb.Length);
                     break;
-                
-                try
-                {
-                    var response = await QueryWithContext(qdrantClient, ollamaClient, query);
-                    Console.WriteLine("\n🤖 Answer:\n");
-                    Console.WriteLine(response);
-                    Console.WriteLine($"\n{new string('─', 60)}\n");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error: {ex.Message}");
                 }
             }
+
+            // Known entity nouns
+            foreach (var noun in new[] { "Employee", "Member", "Book", "Loan", "Fine", 
+                "Payment", "Leave", "Request", "Attendance", "Payroll", "Performance",
+                "Review", "Training", "Candidate", "Recruitment", "Reservation",
+                "Membership", "Author", "Publisher", "Category", "Department",
+                "Position", "Staff", "Dashboard", "Report", "Statement", "History",
+                "Inventory", "Audit", "Record" })
+            {
+                if (name.Contains(noun, StringComparison.OrdinalIgnoreCase))
+                {
+                    nouns.Add(noun);
+                }
+            }
+
+            return (nouns, verbs);
+        }
+
+        private string MatchCapability(StructuralSignals proc, List<string> nouns, List<string> verbs)
+        {
+            // Try noun matching first (most specific)
+            foreach (var noun in nouns)
+            {
+                foreach (var (capability, keywords) in CapabilityVerbs)
+                {
+                    if (keywords.Any(k => k.Equals(noun, StringComparison.OrdinalIgnoreCase) ||
+                                        noun.Contains(k, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        return capability;
+                    }
+                }
+            }
+
+            // Fall back to verb matching
+            foreach (var verb in verbs)
+            {
+                foreach (var (capability, keywords) in CapabilityVerbs)
+                {
+                    if (keywords.Any(k => k.Equals(verb, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        return capability;
+                    }
+                }
+            }
+
+            // Fall back to write-target-based naming
+            string primaryTable = proc.WritesTo
+                .FirstOrDefault(t => !t.Equals("AuditLog") && !t.StartsWith("#") && t.Length > 3);
+            
+            return primaryTable != null ? $"{primaryTable}Management" : "GeneralOperations";
+        }
+
+        private string MatchLifecycleStage(StructuralSignals proc, List<string> nouns, List<string> verbs)
+        {
+            foreach (var noun in nouns)
+            {
+                if (LifecycleStages.TryGetValue(noun, out var stages))
+                {
+                    foreach (var verb in verbs)
+                    {
+                        var match = stages.FirstOrDefault(s => 
+                            s.Equals(verb, StringComparison.OrdinalIgnoreCase));
+                        if (match != null) return match;
+                    }
+                }
+            }
+            
+            return verbs.FirstOrDefault() ?? "Process";
+        }
+
+        private List<StructuralSignals> FindWorkflowNeighbors(StructuralSignals proc, List<StructuralSignals> allProcs)
+        {
+            return allProcs
+                .Where(other => other != proc)
+                .Where(other =>
+                {
+                    // Share write targets (same table, different operation)
+                    bool sharedWrites = proc.WritesTo
+                        .Intersect(other.WritesTo, StringComparer.OrdinalIgnoreCase)
+                        .Any(t => !t.Equals("AuditLog") && !t.StartsWith("#"));
+
+                    // Share read targets with complementary verbs
+                    bool sharedReads = proc.ReadsFrom
+                        .Intersect(other.ReadsFrom, StringComparer.OrdinalIgnoreCase)
+                        .Count() >= 2;
+
+                    // One writes what the other reads (producer-consumer)
+                    bool producerConsumer = proc.WritesTo
+                        .Intersect(other.ReadsFrom, StringComparer.OrdinalIgnoreCase)
+                        .Any(t => !t.Equals("AuditLog"));
+
+                    return sharedWrites || sharedReads || producerConsumer;
+                })
+                .Take(5) // limit workflow neighbors
+                .ToList();
+        }
+
+        private string OrderLifecycleStages(List<string> stages)
+        {
+            var orderedStages = new[] { 
+                "Add", "Register", "Create", "Submit", "Record", "Enroll",
+                "Issue", "Checkout", "Reserve",
+                "Approve", "Process", "Calculate", "Generate",
+                "Renew", "Update", "Transfer", "Promote",
+                "Return", "Close", "Pay", "Waive",
+                "Expire", "Deactivate", "Terminate", "Exit", "Cancel", "Reject",
+                "Delete", "Purge", "Archive"
+            };
+
+            return string.Join(" → ", stages
+                .OrderBy(s => Array.IndexOf(orderedStages, s))
+                .Distinct());
+        }
+    }
+
+    class BusinessCapability
+    {
+        public string CapabilityName { get; set; }
+        public List<string> LifecycleStages { get; set; }
+        public string LifecycleOrder { get; set; }
+        public List<StructuralSignals> Procedures { get; set; }
+        public HashSet<string> CoreEntities { get; set; }
+        public List<(string from, string to)> WorkflowEdges { get; set; }
+    }
+
+    static class SignalDiagnostics
+    {
+        public static void PrintAll(List<StructuralSignals> signals)
+        {
+            Console.WriteLine("\n═══════════════════════════════════════════");
+            Console.WriteLine("  STRUCTURAL SIGNALS EXTRACTED");
+            Console.WriteLine("═══════════════════════════════════════════\n");
+            var procs = signals.Where(s => s.Category == "PROCEDURE").ToList();
+            foreach (var s in procs)
+            {
+                Console.WriteLine($"┌─ {s.ObjectName}");
+                Console.WriteLine($"├─ WritesTo: [{string.Join(", ", s.WritesTo)}]");
+                Console.WriteLine($"├─ ReadsFrom: [{string.Join(", ", s.ReadsFrom)}]");
+                Console.WriteLine($"├─ Classification: {s.ChunkClassification}");
+                Console.WriteLine($"├─ Traits: [{(s.Traits.Any() ? string.Join(", ", s.Traits) : "none")}]");
+                Console.WriteLine($"├─ Business: {s.BusinessLogicScore:F2} | Utility: {s.UtilityScore:F2} | Reporting: {s.ReportingScore:F2}");
+                Console.WriteLine($"├─ DML: INSERT={s.InsertStatementCount} UPDATE={s.UpdateStatementCount} DELETE={s.DeleteStatementCount}");
+                Console.WriteLine($"├─ IFs={s.IfStatementCount} Vals={s.ValidationErrorCount} Txn={s.HasTransactionScope} States={s.StateColumnAssignmentCount}");
+                Console.WriteLine($"├─ {s.ChunkDescription}");
+                Console.WriteLine();
+            }
+            Console.WriteLine($"Total: {signals.Count} | Procs: {procs.Count} | DDL: {signals.Count(s => s.Category == "DDL")} | Seed: {signals.Count(s => s.Category == "SEED_DATA")}");
+        }
+    }
+
+    class Program
+    {
+        static void PrintDomainClusters(List<BusinessDomain> domains)
+        {
+            Console.WriteLine("\n═══════════════════════════════════════════");
+            Console.WriteLine("  BUSINESS CAPABILITIES");
+            Console.WriteLine("═══════════════════════════════════════════\n");
+
+            foreach (var domain in domains)
+            {
+                Console.WriteLine($"┌─ {domain.DomainName}");
+                Console.WriteLine($"├─ Lifecycle: {domain.BusinessFlow}");
+                Console.WriteLine($"├─ Core Entities: [{(domain.OwnedTables.Any() ? string.Join(", ", domain.OwnedTables) : "none")}]");
+                Console.WriteLine($"├─ Procedures ({domain.Procedures.Count}):");
+                
+                foreach (var proc in domain.Procedures.OrderBy(p => GetStageOrder(p, domain.BusinessFlow)))
+                {
+                    string classification = proc.ChunkClassification;
+                    string stage = GetLifecycleStage(proc);
+                    string traits = proc.Traits.Any() 
+                        ? $" [{string.Join(", ", proc.Traits)}]" 
+                        : "";
+                    
+                    Console.WriteLine($"│  ├─ {stage,-12} {proc.ObjectName,-35} ({classification}){traits}");
+                }
+                Console.WriteLine("│");
+                Console.WriteLine();
+            }
+
+            // ── Summary table ──────────────────────────────────────────
+            Console.WriteLine("───────────────────────────────────────────");
+            Console.WriteLine("  CAPABILITY SUMMARY");
+            Console.WriteLine("───────────────────────────────────────────");
+            Console.WriteLine($"  {"Capability",-30} {"Procs",-8} {"Entities",-12} {"Lifecycle"}");
+            Console.WriteLine($"  {"──────────",-30} {"─────",-8} {"────────",-12} {"─────────"}");
+            
+            foreach (var domain in domains)
+            {
+                Console.WriteLine($"  {domain.DomainName,-30} {domain.Procedures.Count,-8} " +
+                    $"{domain.OwnedTables.Count,-12} {domain.BusinessFlow}");
+            }
+            Console.WriteLine();
+            Console.WriteLine($"  Total capabilities: {domains.Count}");
+            Console.WriteLine($"  Total procedures: {domains.Sum(d => d.Procedures.Count)}");
+            
+            // ── Cross-capability dependencies ──────────────────────────
+            Console.WriteLine();
+            Console.WriteLine("───────────────────────────────────────────");
+            Console.WriteLine("  CROSS-CAPABILITY REFERENCES");
+            Console.WriteLine("───────────────────────────────────────────");
+            foreach (var domain in domains)
+            {
+                var externalReads = domain.Procedures
+                    .SelectMany(p => p.ReadsFrom)
+                    .Where(t => !domain.OwnedTables.Contains(t))
+                    .Where(t => !t.Equals("AuditLog") && !t.StartsWith("#") && t.Length > 3)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                
+                if (externalReads.Any())
+                {
+                    Console.WriteLine($"  {domain.DomainName} reads from: [{string.Join(", ", externalReads)}]");
+                }
+            }
+        }
+
+        private static string GetLifecycleStage(StructuralSignals proc)
+        {
+            // Extract verb from procedure name
+            string name = proc.ObjectName.Replace("sp_", "");
+            foreach (var verb in new[] { "Add", "Create", "Submit", "Approve", "Reject",
+                "Process", "Generate", "Get", "Search", "Update", "Delete", "Terminate",
+                "Issue", "Return", "Renew", "Reserve", "Pay", "Waive", "Transfer",
+                "Record", "Enroll", "Bulk", "Calculate" })
+            {
+                if (name.StartsWith(verb, StringComparison.OrdinalIgnoreCase))
+                    return verb;
+            }
+            return "Execute";
+        }
+
+        private static int GetStageOrder(StructuralSignals proc, string lifecycle)
+        {
+            var stages = lifecycle.Split(" → ");
+            string stage = GetLifecycleStage(proc);
+            for (int i = 0; i < stages.Length; i++)
+                if (stages[i].Equals(stage, StringComparison.OrdinalIgnoreCase))
+                    return i;
+            return 999;
+        }
+
+        static void Main(string[] args)
+        {
+            string targetFolder = @"C:\Users\Erwin\Desktop\rag_system\sql_files";
+            string signalsPath = @"C:\Users\Erwin\Desktop\rag_system\codebase_rag\t-sql\shared_data\structural_signals.json";
+            string domainsPath = @"C:\Users\Erwin\Desktop\rag_system\codebase_rag\t-sql\shared_data\domains.json";
+
+            if (!Directory.Exists(targetFolder)) 
+            { 
+                Console.WriteLine($"Folder not found: {targetFolder}"); 
+                return; 
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(signalsPath));
+
+            // ── Parse all SQL files ───────────────────────────────
+            var parser = new StructuralSignalParser();
+            var allSignals = new List<StructuralSignals>();
+            
+            foreach (string filePath in Directory.GetFiles(targetFolder, "*.sql"))
+            {
+                Console.WriteLine($"Processing: {Path.GetFileName(filePath)}");
+                allSignals.AddRange(parser.ParseFile(filePath));
+            }
+
+            // ── Print classified signals ──────────────────────────
+            SignalDiagnostics.PrintAll(allSignals);
+
+            // ── Save signals to JSON ──────────────────────────────
+            var signalsJson = JsonSerializer.Serialize(allSignals,
+                new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+            File.WriteAllText(signalsPath, signalsJson);
+            Console.WriteLine($"Signals saved → {signalsPath}");
+
+            // ── Cluster into domains ──────────────────────────────
+            // ── Discover business capabilities ────────────────────
+            var capabilityDiscoverer = new BusinessCapabilityDiscoverer();
+            var capabilities = capabilityDiscoverer.DiscoverCapabilities(
+                allSignals.Where(s => s.Category == "PROCEDURE").ToList());
+
+            // ── Convert capabilities to domains ───────────────────
+            var domains = capabilities.Select(cap => new BusinessDomain
+            {
+                DomainName = cap.Value.CapabilityName,
+                BusinessFlow = cap.Value.LifecycleOrder,
+                OwnedTables = new HashSet<string>(cap.Value.CoreEntities, StringComparer.OrdinalIgnoreCase),
+                Procedures = cap.Value.Procedures,
+                AllReadTables = new HashSet<string>(
+                    cap.Value.Procedures.SelectMany(p => p.ReadsFrom), 
+                    StringComparer.OrdinalIgnoreCase),
+                AllWriteTables = new HashSet<string>(
+                    cap.Value.Procedures.SelectMany(p => p.WritesTo), 
+                    StringComparer.OrdinalIgnoreCase)
+            }).ToList();
+
+            // ── Print domain clusters ─────────────────────────────
+            PrintDomainClusters(domains);
+
+            // ── Save domains to JSON ──────────────────────────────
+            var domainsJson = JsonSerializer.Serialize(domains,
+                new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+            File.WriteAllText(domainsPath, domainsJson);
+            Console.WriteLine($"Domains saved → {domainsPath}");
+
+            Console.WriteLine($"\nDone! {allSignals.Count} signals → {domains.Count} domains");
         }
     }
 }
