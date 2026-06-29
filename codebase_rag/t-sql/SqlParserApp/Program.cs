@@ -122,6 +122,136 @@ namespace SqlChunkerApp
                 if (HasBatchProcessing) score -= 0.15;
                 return Math.Max(-1.0, Math.Min(1.0, Math.Round(score, 2)));
             }
+        }   
+
+        /// <summary>
+        /// Renders a SemanticIntent into natural English.
+        /// No raw counts appear in the output.
+        /// </summary>
+        static class SemanticSummaryRenderer
+        {
+            public static string Render(SemanticIntent intent)
+            {
+                var sb = new System.Text.StringBuilder();
+
+                // ── Core operation ─────────────────────────────────────
+                sb.Append($"{intent.Operation} {intent.PrimaryEntity}");
+
+                // ── Related entities ───────────────────────────────────
+                if (intent.RelatedEntities.Any())
+                {
+                    sb.Append($" involving {string.Join(", ", intent.RelatedEntities)}");
+                }
+
+                sb.Append(". ");
+
+                // ── Business rules ─────────────────────────────────────
+                if (intent.BusinessRules.Any())
+                {
+                    sb.Append("Enforces ");
+                    sb.Append(string.Join(" with ", intent.BusinessRules));
+                    sb.Append(". ");
+                }
+
+                // ── State transitions ──────────────────────────────────
+                if (intent.StateTransitions.Any())
+                {
+                    sb.Append(string.Join(". ", intent.StateTransitions.Select(t => char.ToUpper(t[0]) + t.Substring(1))));
+                    sb.Append(". ");
+                }
+
+                // ── Outputs ────────────────────────────────────────────
+                if (intent.Outputs.Any())
+                {
+                    sb.Append("Upon completion, ");
+                    sb.Append(string.Join(" and ", intent.Outputs));
+                    sb.Append(". ");
+                }
+
+                // ── Side effects ───────────────────────────────────────
+                if (intent.SideEffects.Any())
+                {
+                    sb.Append("Additionally, ");
+                    sb.Append(string.Join(", ", intent.SideEffects));
+                    sb.Append(". ");
+                }
+
+                // ── Behavioral context ─────────────────────────────────
+                sb.Append($"Operates as a{("aeiou".Contains(intent.ProcessingStyle[0]) ? "n " : " ")}");
+                sb.Append($"{intent.ProcessingStyle} process at {intent.DataScope} scope");
+
+                if (intent.IsAtomic)
+                    sb.Append(" with transactional integrity");
+
+                sb.Append(".");
+
+                return sb.ToString();
+            }
+        }
+
+        // Remove the old SemanticSummary property, replace with:
+        public string SemanticSummary
+        {
+            get
+            {
+                var intent = SemanticIntentExtractor.Extract(this);
+                return SemanticSummaryRenderer.Render(intent);
+            }
+        }
+
+        private string DetermineOperationType()
+        {
+            if (OutputParameters.Count > 0 && InsertStatementCount > 0)
+                return "entity creation";
+            if (StateColumnAssignmentCount >= 2)
+                return "lifecycle state transition";
+            if (UpdateStatementCount > InsertStatementCount)
+                return "entity update";
+            if (DeleteStatementCount > 0)
+                return "entity deletion";
+            if (InsertStatementCount > 0)
+                return "data insertion";
+            return "data modification";
+        }
+
+        private List<string> ExtractBusinessEntities()
+        {
+            var entities = new List<string>();
+            string name = ObjectName.Replace("sp_", "").Replace("_", "");
+            
+            // Extract nouns from procedure name using camelCase splitting
+            var words = new List<string>();
+            int start = 0;
+            for (int i = 1; i < name.Length; i++)
+                if (char.IsUpper(name[i]) && !char.IsUpper(name[i - 1]))
+                { words.Add(name.Substring(start, i - start)); start = i; }
+            if (start < name.Length) words.Add(name.Substring(start));
+
+            // First word is usually a verb, skip it
+            foreach (var word in words.Skip(1))
+                if (word.Length > 2 && !IsCommonWord(word))
+                    entities.Add(word);
+
+            // If no entities found in name, use primary write target
+            if (!entities.Any())
+            {
+                var primaryWrite = WritesTo.FirstOrDefault(t => 
+                    !t.Equals("AuditLog") && !t.StartsWith("#") && t.Length > 3);
+                if (primaryWrite != null)
+                    entities.Add(primaryWrite);
+            }
+
+            return entities;
+        }
+
+        private bool IsCommonWord(string word)
+        {
+            var common = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "New", "Old", "All", "By", "Top", "Get", "Set", "Bulk", "Monthly",
+                "Daily", "Annual", "Current", "Next", "Previous"
+            };
+            return common.Contains(word);
         }
 
         /// <summary>
@@ -210,28 +340,805 @@ namespace SqlChunkerApp
             get
             {
                 var sb = new System.Text.StringBuilder();
-
-                sb.Append(ChunkClassification switch
-                {
-                    "ARCHIVE"            => $"Archive — moves data to history tables",
-                    "PURGE"              => $"Purge — deletes old records without archiving",
-                    "AUDIT"              => $"Audit — logs to AuditLog without modifying business data",
-                    "LOOKUP"             => $"Lookup — simple single-table retrieval",
-                    "REPORT"             => $"Report — read-only result set across {DistinctTableCount} tables",
-                    "CONFIG"             => $"Configuration — parameter-driven setup",
-                    "BUSINESS_OPERATION" => $"Business operation — writes to [{string.Join(", ", WritesTo.Where(t => !t.Equals("AuditLog")))}]",
-                    _                    => $"Utility — general-purpose operation"
-                });
-
+                sb.AppendLine($"[{ChunkClassification}] {SemanticSummary}");
                 if (Traits.Any())
+                    sb.Append($" Traits: {string.Join(", ", Traits.Select(t => t.ToLower().Replace("_", " ")))}.");
+                return sb.ToString().Trim();
+            }
+        }
+    }
+
+    // DELETE everything from "class SemanticIntent" inside StructuralSignals 
+    // down to the closing brace of RagChunkEmitter
+
+    // ADD these at namespace level, after StructuralSignals closing brace:
+
+    class SemanticIntent
+    {
+        public string Operation { get; set; }
+        public string PrimaryEntity { get; set; }
+        public List<string> RelatedEntities { get; set; } = new();
+        public List<string> BusinessRules { get; set; } = new();
+        public List<string> StateTransitions { get; set; } = new();
+        public List<string> Outputs { get; set; } = new();
+        public List<string> SideEffects { get; set; } = new();
+        public bool IsAtomic { get; set; }
+        public bool SpansMultipleDomains { get; set; }
+        public string ProcessingStyle { get; set; }
+        public string DataScope { get; set; }
+    }
+
+    static class SemanticIntentExtractor
+    {
+        public static SemanticIntent Extract(StructuralSignals s)
+        {
+            var intent = new SemanticIntent();
+            intent.Operation = DetermineOperation(s);
+            intent.PrimaryEntity = ExtractPrimaryEntity(s);
+            intent.RelatedEntities = ExtractRelatedEntities(s);
+            intent.BusinessRules = ExtractBusinessRules(s);
+            intent.StateTransitions = ExtractStateTransitions(s);
+            intent.Outputs = ExtractOutputs(s);
+            intent.SideEffects = ExtractSideEffects(s);
+            intent.IsAtomic = s.HasTransactionScope;
+            intent.SpansMultipleDomains = s.DistinctTableCount >= 4;
+            intent.ProcessingStyle = DetermineProcessingStyle(s);
+            intent.DataScope = DetermineDataScope(s);
+            return intent;
+        }
+
+        private static string DetermineOperation(StructuralSignals s) => s.ChunkClassification switch
+        {
+            "BUSINESS_OPERATION" when s.OutputParameters.Count > 0 && s.InsertStatementCount > 0 => "Creates",
+            "BUSINESS_OPERATION" when s.StateColumnAssignmentCount >= 2 => "Progresses",
+            "BUSINESS_OPERATION" when s.DeleteStatementCount > 0 => "Removes",
+            "BUSINESS_OPERATION" when s.UpdateStatementCount > s.InsertStatementCount => "Updates",
+            "BUSINESS_OPERATION" => "Modifies",
+            "REPORT" when s.GroupByCount > 0 => "Summarizes",
+            "REPORT" => "Reports on",
+            "ARCHIVE" => "Archives",
+            "PURGE" => "Purges",
+            "AUDIT" => "Audits",
+            "LOOKUP" => "Retrieves",
+            "CONFIG" => "Configures",
+            _ => "Processes"
+        };
+
+        private static string ExtractPrimaryEntity(StructuralSignals s)
+        {
+            string name = s.ObjectName.Replace("sp_", "").Replace("_", "");
+            var words = SplitCamelCase(name);
+            var entities = words.Skip(1).Where(w => w.Length > 2 && !IsStopWord(w)).ToList();
+            if (entities.Any()) return string.Join(" ", entities).ToLower();
+            var pw = s.WritesTo.FirstOrDefault(t => !IsInfrastructure(t));
+            return pw?.ToLower() ?? "data";
+        }
+
+        private static List<string> ExtractRelatedEntities(StructuralSignals s)
+        {
+            var entities = new List<string>();
+            entities.AddRange(s.ReadsFrom.Where(t => !s.WritesTo.Contains(t) && !IsInfrastructure(t)).Take(3).Select(HumanizeTableName));
+            var pw = s.WritesTo.FirstOrDefault(t => !IsInfrastructure(t));
+            entities.AddRange(s.WritesTo.Where(t => !IsInfrastructure(t) && !t.Equals(pw)).Take(2).Select(HumanizeTableName));
+            return entities.Distinct().ToList();
+        }
+
+        private static List<string> ExtractBusinessRules(StructuralSignals s)
+        {
+            var rules = new List<string>();
+            if (s.ValidationErrorCount >= 3) rules.Add("multiple validation checks");
+            else if (s.ValidationErrorCount > 0) rules.Add("input validation");
+            if (s.IfStatementCount >= 5) rules.Add("complex business logic branching");
+            else if (s.IfStatementCount >= 2) rules.Add("conditional business rules");
+            if (s.HasBatchProcessing) rules.Add("batch processing safeguards");
+            if (s.OutputParameters.Count > 0) rules.Add("entity creation with identity return");
+            return rules;
+        }
+
+        private static List<string> ExtractStateTransitions(StructuralSignals s)
+        {
+            var transitions = new List<string>();
+            var cols = s.StateColumns.Distinct().ToList();
+            if (cols.Contains("Status")) transitions.Add("manages record status lifecycle");
+            if (cols.Contains("IsActive")) transitions.Add("handles activation and deactivation");
+            if (cols.Contains("ExpiryDate") || cols.Contains("ClosedDate")) transitions.Add("manages expiration timeline");
+            if (cols.Contains("PaidDate") || cols.Contains("ReturnDate")) transitions.Add("tracks completion dates");
+            if (!transitions.Any() && s.StateColumnAssignmentCount >= 2) transitions.Add("manages business state transitions");
+            return transitions;
+        }
+
+        private static List<string> ExtractOutputs(StructuralSignals s)
+        {
+            var outputs = new List<string>();
+            if (s.OutputParameters.Count > 0) outputs.Add($"returns new {ExtractPrimaryEntity(s)} identifier");
+            if (s.SelectStatementCount > 0 && !s.IsReadOnly) outputs.Add("returns confirmation data");
+            if (s.SelectStatementCount >= 3 && s.IsReadOnly) outputs.Add("produces multi-section report");
+            else if (s.SelectStatementCount > 0 && s.IsReadOnly) outputs.Add("produces result set");
+            if (s.GroupByCount > 0) outputs.Add($"with {s.GroupByCount} levels of aggregation");
+            return outputs;
+        }
+
+        private static List<string> ExtractSideEffects(StructuralSignals s)
+        {
+            var effects = new List<string>();
+            if (s.WritesTo.Contains("AuditLog")) effects.Add("maintains audit trail");
+            if (s.TempTableCount > 0) effects.Add("uses temporary staging tables");
+            if (s.HasWaitForDelay) effects.Add("includes processing delays for system stability");
+            if (s.PrintStatementCount > 5) effects.Add("provides detailed operational logging");
+            if (s.WritesTo.Where(t => !IsInfrastructure(t)).Count() >= 3) effects.Add("maintains referential consistency across related tables");
+            return effects;
+        }
+
+        private static string DetermineProcessingStyle(StructuralSignals s)
+        {
+            if (s.HasBatchProcessing && s.HasCursorUsage) return "batch with row-by-row processing";
+            if (s.HasBatchProcessing) return "batch";
+            if (s.HasCursorUsage) return "row-by-row";
+            if (s.HasWaitForDelay) return "scheduled";
+            if (s.HasTransactionScope) return "transactional";
+            return "direct";
+        }
+
+        private static string DetermineDataScope(StructuralSignals s)
+        {
+            if (s.IsReadOnly && s.DistinctTableCount >= 6) return "enterprise-wide";
+            if (s.IsReadOnly && s.DistinctTableCount >= 3) return "department-level";
+            if (s.DistinctTableCount >= 4) return "cross-domain";
+            if (s.DistinctTableCount <= 1) return "single entity";
+            return "focused domain";
+        }
+
+        public static List<string> SplitCamelCase(string name)
+        {
+            var words = new List<string>();
+            int start = 0;
+            for (int i = 1; i < name.Length; i++)
+                if (char.IsUpper(name[i]) && !char.IsUpper(name[i - 1]))
+                { words.Add(name.Substring(start, i - start)); start = i; }
+            if (start < name.Length) words.Add(name.Substring(start));
+            return words;
+        }
+
+        private static bool IsStopWord(string word) =>
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "New", "Old", "All", "By", "Top", "Get", "Set", "Bulk", "Monthly", "Daily", "Annual" }
+            .Contains(word);
+
+        private static bool IsInfrastructure(string t) =>
+            string.IsNullOrEmpty(t) || t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase)
+            || t.StartsWith("#") || t.EndsWith("_Archive") || t.Length <= 3;
+
+        public static string HumanizeTableName(string tableName)
+        {
+            if (string.IsNullOrEmpty(tableName)) return tableName;
+            return string.Join(" ", SplitCamelCase(tableName)).ToLower();
+        }
+    }
+
+    static class SemanticSummaryRenderer
+    {
+        public static string Render(SemanticIntent intent)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"{intent.Operation} {intent.PrimaryEntity}");
+            if (intent.RelatedEntities.Any()) sb.Append($" involving {string.Join(", ", intent.RelatedEntities)}");
+            sb.Append(". ");
+            if (intent.BusinessRules.Any())
+            {
+                sb.Append("Enforces ");
+                sb.Append(string.Join(" with ", intent.BusinessRules));
+                sb.Append(". ");
+            }
+            if (intent.StateTransitions.Any())
+            {
+                sb.Append(string.Join(". ", intent.StateTransitions.Select(t => char.ToUpper(t[0]) + t.Substring(1))));
+                sb.Append(". ");
+            }
+            if (intent.Outputs.Any())
+            {
+                sb.Append("Upon completion, ");
+                sb.Append(string.Join(" and ", intent.Outputs));
+                sb.Append(". ");
+            }
+            if (intent.SideEffects.Any())
+            {
+                sb.Append("Additionally, ");
+                sb.Append(string.Join(", ", intent.SideEffects));
+                sb.Append(". ");
+            }
+            sb.Append($"Operates as a{("aeiou".Contains(intent.ProcessingStyle[0]) ? "n " : " ")}");
+            sb.Append($"{intent.ProcessingStyle} process at {intent.DataScope} scope");
+            if (intent.IsAtomic) sb.Append(" with transactional integrity");
+            sb.Append(".");
+            return sb.ToString();
+        }
+    }
+
+    class RagChunk
+    {
+        public string Id { get; set; }
+        public string EmbeddingText { get; set; }
+        public RagChunkMetadata Metadata { get; set; }
+        public RagChunkSql Sql { get; set; }
+    }
+
+    class RagChunkMetadata
+    {
+        public string Classification { get; set; }
+        public List<string> Traits { get; set; }
+        public double BusinessScore { get; set; }
+        public double ReportingScore { get; set; }
+        public string Capability { get; set; }
+        public string Stage { get; set; }
+        public List<string> Reads { get; set; }
+        public List<string> Writes { get; set; }
+        public List<string> Dependencies { get; set; }
+        public int ProcedureLength { get; set; }
+        public int LineCount { get; set; }
+    }
+
+    class RagChunkSql
+    {
+        public string Header { get; set; }
+        public string Validation { get; set; }
+        public string Main { get; set; }
+        public string Cleanup { get; set; }
+    }
+
+    class RagChunkEmitter
+    {
+        public List<RagChunk> EmitChunks(List<BusinessDomain> domains, List<StructuralSignals> allSignals)
+        {
+            var chunks = new List<RagChunk>();
+            foreach (var domain in domains)
+                foreach (var proc in domain.Procedures)
+                    chunks.Add(BuildChunk(proc, domain, allSignals));
+            return chunks;
+        }
+
+        private RagChunk BuildChunk(StructuralSignals proc, BusinessDomain domain, List<StructuralSignals> allSignals)
+        {
+            var intent = SemanticIntentExtractor.Extract(proc);
+            var stage = GetLifecycleStage(proc);
+            return new RagChunk
+            {
+                Id = proc.ObjectName,
+                EmbeddingText = BuildEmbeddingText(proc, domain, intent, stage),
+                Metadata = new RagChunkMetadata
                 {
-                    sb.Append(". Traits: ");
-                    sb.Append(string.Join(", ", Traits.Select(t => t.ToLower().Replace("_", " "))));
-                    sb.Append(".");
+                    Classification = proc.ChunkClassification,
+                    Traits = proc.Traits,
+                    BusinessScore = Math.Round(proc.BusinessLogicScore, 2),
+                    ReportingScore = Math.Round(proc.ReportingScore, 2),
+                    Capability = domain.DomainName,
+                    Stage = stage,
+                    Reads = proc.ReadsFrom.Where(t => !IsInfrastructure(t)).OrderBy(t => t).ToList(),
+                    Writes = proc.WritesTo.Where(t => !IsInfrastructure(t)).OrderBy(t => t).ToList(),
+                    Dependencies = FindDependencies(proc, allSignals),
+                    ProcedureLength = proc.RawSql.Length,
+                    LineCount = proc.RawSql.Split('\n').Length
+                },
+                Sql = SplitSqlSections(proc)
+            };
+        }
+
+        private string BuildEmbeddingText(StructuralSignals proc, BusinessDomain domain, SemanticIntent intent, string stage)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine(proc.SemanticSummary);
+            sb.AppendLine();
+            sb.AppendLine($"This procedure belongs to the {domain.DomainName} capability");
+            sb.AppendLine($"and represents the {stage.ToLower()} stage of the {domain.BusinessFlow.ToLower()} lifecycle.");
+            sb.AppendLine();
+            sb.AppendLine($"It operates primarily on {intent.PrimaryEntity}");
+            if (intent.RelatedEntities.Any()) sb.AppendLine($"and involves {string.Join(", ", intent.RelatedEntities)}.");
+            sb.AppendLine();
+            if (intent.BusinessRules.Any())
+            {
+                sb.AppendLine("Business rules enforced:");
+                foreach (var rule in intent.BusinessRules) sb.AppendLine($"- {rule}");
+                sb.AppendLine();
+            }
+            if (intent.StateTransitions.Any())
+            {
+                sb.AppendLine("Lifecycle state management:");
+                foreach (var t in intent.StateTransitions) sb.AppendLine($"- {t}");
+                sb.AppendLine();
+            }
+            var related = domain.Procedures.Where(p => p != proc).Select(p => p.ObjectName).Take(5).ToList();
+            if (related.Any())
+            {
+                sb.AppendLine("Related procedures in the same workflow:");
+                foreach (var r in related) sb.AppendLine($"- {r}");
+                sb.AppendLine();
+            }
+            sb.Append($"This is a{("aeiou".Contains(intent.ProcessingStyle[0]) ? "n " : " ")}{intent.ProcessingStyle} operation");
+            if (intent.IsAtomic) sb.Append(" with transactional guarantees");
+            sb.Append(".");
+            return sb.ToString().Trim();
+        }
+
+        private RagChunkSql SplitSqlSections(StructuralSignals proc)
+        {
+            string sql = proc.RawSql;
+            var sections = new RagChunkSql();
+            int headerEnd = FindBoundary(sql, new[] { "BEGIN TRY", "BEGIN TRANSACTION", "BEGIN" });
+            sections.Header = headerEnd > 0 ? sql.Substring(0, headerEnd).Trim() : sql.Substring(0, Math.Min(500, sql.Length)).Trim();
+            int vs = sql.IndexOf("BEGIN TRY", StringComparison.OrdinalIgnoreCase);
+            int ve = FindBoundary(sql, new[] { "INSERT ", "UPDATE ", "DELETE ", "SELECT " }, vs > 0 ? vs : 0);
+            if (vs > 0 && ve > vs) sections.Validation = sql.Substring(vs, ve - vs).Trim();
+            int ms = ve > 0 ? ve : FindBoundary(sql, new[] { "INSERT ", "UPDATE ", "DELETE ", "SELECT " });
+            int me = sql.LastIndexOf("COMMIT TRANSACTION", StringComparison.OrdinalIgnoreCase);
+            if (me < 0) me = sql.LastIndexOf("END TRY", StringComparison.OrdinalIgnoreCase);
+            sections.Main = (ms > 0 && me > ms) ? sql.Substring(ms, me - ms).Trim() : sql.Trim();
+            int cs = sql.LastIndexOf("BEGIN CATCH", StringComparison.OrdinalIgnoreCase);
+            if (cs > 0) sections.Cleanup = sql.Substring(cs).Trim();
+            return sections;
+        }
+
+        private int FindBoundary(string sql, string[] markers, int start = 0)
+        {
+            int b = int.MaxValue;
+            foreach (var m in markers) { int p = sql.IndexOf(m, start, StringComparison.OrdinalIgnoreCase); if (p > 0 && p < b) b = p; }
+            return b == int.MaxValue ? -1 : b;
+        }
+
+        private List<string> FindDependencies(StructuralSignals proc, List<StructuralSignals> allSignals)
+        {
+            var deps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rt in proc.ReadsFrom.Where(t => !IsInfrastructure(t)))
+                foreach (var w in allSignals.Where(o => o != proc && o.WritesTo.Contains(rt) && !o.IsReadOnly).Select(o => o.ObjectName))
+                    deps.Add($"{w} (writes {rt})");
+            return deps.Take(10).ToList();
+        }
+
+        private string GetLifecycleStage(StructuralSignals proc)
+        {
+            string name = proc.ObjectName.Replace("sp_", "");
+            int split = 1;
+            while (split < name.Length && !char.IsUpper(name[split])) split++;
+            string stage = split > 1 ? name.Substring(0, split) : name;
+            if (string.IsNullOrEmpty(stage) || stage.Length <= 1)
+                return proc.ChunkClassification switch { "ARCHIVE" => "Archive", "PURGE" => "Purge", "AUDIT" => "Audit", "REPORT" => "Generate", "LOOKUP" => "Get", _ => "Process" };
+            return stage;
+        }
+
+        private bool IsInfrastructure(string t) =>
+            string.IsNullOrEmpty(t) || t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase) || t.StartsWith("#") || t.EndsWith("_Archive") || t.Length <= 3;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // SEMANTIC SECTION CHUNKER
+    // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// A single semantic section of a stored procedure.
+    /// </summary>
+    class SemanticSection
+    {
+        public string SectionType { get; set; }       // HEADER, VALIDATION, BUSINESS_RULES, etc.
+        public string Purpose { get; set; }            // Human-readable description
+        public string SqlText { get; set; }            // The SQL code for this section
+        public int StartLine { get; set; }
+        public int EndLine { get; set; }
+    }
+
+    /// <summary>
+    /// A fully chunked stored procedure with semantic sections.
+    /// </summary>
+    class SemanticChunk
+    {
+        public string Id { get; set; }
+        public string EmbeddingText { get; set; }
+        public RagChunkMetadata Metadata { get; set; }
+        public List<SemanticSection> Sections { get; set; }  // ← ONLY this, no "Sql" property
+    }
+
+    /// <summary>
+    /// Chunks a stored procedure into semantic sections based on SQL intent.
+    /// Walks the SQL line by line, detecting transitions between logical sections.
+    /// </summary>
+    class SemanticSectionChunker
+    {
+        private List<SemanticSection> MergeRelatedSections(List<SemanticSection> sections)
+        {
+            if (sections.Count <= 1) return sections;
+
+            var merged = new List<SemanticSection>();
+            merged.Add(sections[0]);
+
+            for (int i = 1; i < sections.Count; i++)
+            {
+                var current = sections[i];
+                var last = merged[merged.Count - 1];
+
+                // Rule 1: Same type → always merge
+                if (last.SectionType == current.SectionType)
+                {
+                    last.SqlText += "\n" + current.SqlText;
+                    last.EndLine = current.EndLine;
+                    continue;
                 }
 
-                return sb.ToString();
+                // Rule 2: These types always merge together (they're part of validation)
+                var validationTypes = new HashSet<string> { "VALIDATION", "INITIALIZATION", "BUSINESS_RULES" };
+                if (validationTypes.Contains(last.SectionType) && validationTypes.Contains(current.SectionType))
+                {
+                    last.SectionType = "VALIDATION";
+                    last.Purpose = "Input validation and business rule checks";
+                    last.SqlText += "\n" + current.SqlText;
+                    last.EndLine = current.EndLine;
+                    continue;
+                }
+
+                // Rule 3: Short sections (≤2 lines) get absorbed into next
+                if (last.SqlText.Split('\n').Length <= 2)
+                {
+                    current.SqlText = last.SqlText + "\n" + current.SqlText;
+                    current.StartLine = last.StartLine;
+                    merged.RemoveAt(merged.Count - 1);
+                    merged.Add(current);
+                    continue;
+                }
+
+                merged.Add(current);
             }
+
+            return merged;
+        }
+
+        public SemanticChunk ChunkProcedure(
+            StructuralSignals proc,
+            BusinessDomain domain,
+            List<StructuralSignals> allSignals)
+        {
+            var intent = SemanticIntentExtractor.Extract(proc);
+            var stage = GetLifecycleStage(proc);
+            var sections = SplitIntoSections(proc.RawSql);
+            sections = MergeRelatedSections(sections);
+            Console.WriteLine($"  After merge: {sections.Count} sections");
+            foreach (var s in sections)
+                Console.WriteLine($"    {s.SectionType} (lines {s.StartLine}-{s.EndLine})");
+
+            return new SemanticChunk
+            {
+                Id = proc.ObjectName,
+                EmbeddingText = BuildEmbeddingText(proc, domain, intent, stage, sections),
+                Metadata = new RagChunkMetadata
+                {
+                    Classification = proc.ChunkClassification,
+                    Traits = proc.Traits,
+                    BusinessScore = Math.Round(proc.BusinessLogicScore, 2),
+                    ReportingScore = Math.Round(proc.ReportingScore, 2),
+                    Capability = domain.DomainName,
+                    Stage = stage,
+                    Reads = proc.ReadsFrom.Where(t => !IsInfrastructure(t)).OrderBy(t => t).ToList(),
+                    Writes = proc.WritesTo.Where(t => !IsInfrastructure(t)).OrderBy(t => t).ToList(),
+                    Dependencies = FindDependencies(proc, allSignals),
+                    ProcedureLength = proc.RawSql.Length,
+                    LineCount = proc.RawSql.Split('\n').Length
+                },
+                Sections = sections
+            };
+        }
+
+        private List<SemanticSection> SplitIntoSections(string sql)
+        {
+            var lines = sql.Split('\n');
+            var sections = new List<SemanticSection>();
+
+            string currentSection = null;
+            int sectionStart = 0;
+            var sectionLines = new List<string>();
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].Trim();
+                string lineUpper = line.ToUpperInvariant();
+
+                if (string.IsNullOrWhiteSpace(line) || line.StartsWith("--"))
+                {
+                    sectionLines.Add(lines[i]);
+                    continue;
+                }
+
+                string detectedSection = ClassifyLine(lineUpper, currentSection, i, lines.Length);
+
+                if (detectedSection != currentSection)
+                {
+                    if (currentSection != null && HasContent(sectionLines))
+                    {
+                        sections.Add(CreateSection(currentSection, sectionLines, sectionStart, i));
+                    }
+
+                    currentSection = detectedSection;
+                    sectionStart = i;
+                    sectionLines = new List<string> { lines[i] };
+                }
+                else
+                {
+                    sectionLines.Add(lines[i]);
+                }
+            }
+
+            if (currentSection != null && HasContent(sectionLines))
+            {
+                sections.Add(CreateSection(currentSection, sectionLines, sectionStart, lines.Length));
+            }
+
+            return sections;
+        }
+
+        private string ClassifyLine(string lineUpper, string currentSection, int lineIndex, int totalLines)
+        {
+            // ── 1. HEADER ──────────────────────────────────────────────────────────────
+            if (lineUpper.StartsWith("CREATE PROCEDURE") || lineUpper.StartsWith("CREATE PROC") ||
+                lineUpper.StartsWith("ALTER PROCEDURE")  || lineUpper.StartsWith("ALTER PROC"))
+                return "HEADER";
+
+            // SET NOCOUNT and AS/BEGIN at the very top stay in HEADER
+            if (lineUpper.StartsWith("SET NOCOUNT") &&
+                (currentSection == "HEADER" || currentSection == null))
+                return "HEADER";
+
+            // ── 2. ERROR_HANDLING (must be checked before anything else) ──────────────
+            if (lineUpper.StartsWith("BEGIN CATCH") || lineUpper.StartsWith("END CATCH") ||
+                lineUpper.Contains("ERROR_MESSAGE()") || lineUpper.Contains("ERROR_SEVERITY()") ||
+                lineUpper.Contains("ERROR_STATE()"))
+                return "ERROR_HANDLING";
+
+            if (currentSection == "ERROR_HANDLING")
+                return "ERROR_HANDLING";
+
+            // ── 3. CLEANUP ─────────────────────────────────────────────────────────────
+            if (lineUpper.StartsWith("DROP TABLE") || lineUpper.StartsWith("DEALLOCATE") ||
+                lineUpper.StartsWith("CLOSE "))
+                return "CLEANUP";
+
+            // ── 4. TRANSACTION ─────────────────────────────────────────────────────────
+            if (lineUpper.StartsWith("BEGIN TRANSACTION") || lineUpper.StartsWith("BEGIN TRAN ") ||
+                lineUpper == "BEGIN TRAN"                 ||
+                lineUpper.StartsWith("COMMIT")            || lineUpper.StartsWith("ROLLBACK"))
+                return "TRANSACTION";
+
+            // ── 5. AUDIT ───────────────────────────────────────────────────────────────
+            if (lineUpper.Contains("AUDITLOG") &&
+                (lineUpper.Contains("INSERT") || lineUpper.Contains("VALUES")))
+                return "AUDIT";
+
+            if (currentSection == "AUDIT" && lineUpper.StartsWith("VALUES"))
+                return "AUDIT";
+
+            // ── 6. BEGIN TRY → VALIDATION ──────────────────────────────────────────────
+            if (lineUpper.StartsWith("BEGIN TRY"))
+                return "VALIDATION";
+
+            // ── 7. INITIALIZATION ──────────────────────────────────────────────────────
+            // DECLARE always means initialization (variable setup), regardless of section.
+            // Exception: the very first DECLARE block before BEGIN TRY belongs to HEADER
+            // only if currentSection is still HEADER.  Once we've seen BEGIN TRY (VALIDATION),
+            // all DECLAREs are mid-body initialization.
+            if (lineUpper.StartsWith("DECLARE @"))
+            {
+                // Before BEGIN TRY → these are proc-level declarations, keep in HEADER
+                if (currentSection == "HEADER" || currentSection == null)
+                    return "HEADER";
+                // Inside the body → INITIALIZATION
+                return "INITIALIZATION";
+            }
+
+            // SET @var and SELECT @var = ... are initialization when we haven't started DML yet
+            bool beforeFirstDml =
+                currentSection == "VALIDATION"    ||
+                currentSection == "INITIALIZATION" ||
+                currentSection == "TRANSACTION"   ||   // ← was missing; covers SELECT @var after BEGIN TRAN
+                currentSection == "HEADER"        ||
+                currentSection == null;
+
+            if ((lineUpper.StartsWith("SET @") || lineUpper.StartsWith("SELECT @")) && beforeFirstDml)
+                return "INITIALIZATION";
+
+            // ── 8. VALIDATION: explicit guard checks ───────────────────────────────────
+            if ((lineUpper.StartsWith("RAISERROR") || lineUpper.StartsWith("THROW ")) &&
+                currentSection != "ERROR_HANDLING")
+                return "VALIDATION";
+
+            if ((lineUpper.StartsWith("IF ") || lineUpper.StartsWith("IF(")) &&
+                IsInputValidation(lineUpper))
+                return "VALIDATION";
+
+            // ── 9. DATA_MODIFICATION: real-table writes ────────────────────────────────
+            bool isDml = lineUpper.StartsWith("INSERT ")   || lineUpper.StartsWith("INSERT\t")  ||
+                        lineUpper.StartsWith("UPDATE ")   || lineUpper.StartsWith("UPDATE\t")  ||
+                        lineUpper.StartsWith("DELETE ")   || lineUpper.StartsWith("DELETE\t")  ||
+                        lineUpper.StartsWith("MERGE ");
+
+            if (isDml && !lineUpper.Contains("AUDITLOG") &&
+                !lineUpper.StartsWith("INSERT INTO #")   &&
+                !lineUpper.StartsWith("INSERT  INTO #")  &&
+                !lineUpper.StartsWith("UPDATE #"))
+                return "DATA_MODIFICATION";
+
+            // Temp-table INSERT = staging setup → INITIALIZATION
+            if (lineUpper.StartsWith("INSERT INTO #") || lineUpper.StartsWith("INSERT  INTO #"))
+                return "INITIALIZATION";
+
+            // Temp-table UPDATE = calculation loop → BUSINESS_RULES
+            if (lineUpper.StartsWith("UPDATE #"))
+                return "BUSINESS_RULES";
+
+            // ── 10. BUSINESS_RULES: decision logic and calculations ────────────────────
+            if (lineUpper.StartsWith("IF ")    || lineUpper.StartsWith("IF(")     ||
+                lineUpper.StartsWith("ELSE ")  || lineUpper == "ELSE"             ||
+                lineUpper.StartsWith("ELSE IF ") || lineUpper.StartsWith("WHILE "))
+                return "BUSINESS_RULES";
+
+            // SET @var / SELECT @var after the first DML = mid-calculation assignment
+            if ((lineUpper.StartsWith("SET @") || lineUpper.StartsWith("SELECT @")) &&
+                !beforeFirstDml)
+                return "BUSINESS_RULES";
+
+            // ── 11. OUTPUT vs DATA_RETRIEVAL ───────────────────────────────────────────
+            if (lineUpper.StartsWith("SELECT ") &&
+                !lineUpper.Contains("SELECT @") &&
+                !lineUpper.Contains("SELECT 1") &&
+                !lineUpper.Contains("SELECT COUNT"))
+            {
+                // A SELECT that comes after DML/AUDIT/TRANSACTION, or in the last third,
+                // is returning results to the caller.
+                if (currentSection == "DATA_MODIFICATION" ||
+                    currentSection == "AUDIT"             ||
+                    currentSection == "TRANSACTION"       ||
+                    lineIndex > totalLines * 0.60)
+                    return "OUTPUT";
+
+                return "DATA_RETRIEVAL";
+            }
+
+            // PRINT near the end or after DML = output/logging to caller
+            if (lineUpper.StartsWith("PRINT ") &&
+                (currentSection == "DATA_MODIFICATION" ||
+                currentSection == "AUDIT"             ||
+                currentSection == "TRANSACTION"       ||
+                lineIndex > totalLines * 0.60))
+                return "OUTPUT";
+
+            // ── 12. Fall-through ───────────────────────────────────────────────────────
+            return currentSection ?? "HEADER";
+        }
+
+        private bool IsInputValidation(string lineUpper)
+        {
+            // Never treat transaction-management IFs as validation
+            if (lineUpper.Contains("@@TRANCOUNT") ||
+                lineUpper.Contains("@@ERROR")     ||
+                lineUpper.Contains("@@FETCH_STATUS"))
+                return false;
+
+            if (lineUpper.Contains("EXISTS"))                                  return true;
+            if (lineUpper.Contains("IS NULL") || lineUpper.Contains("IS NOT NULL")) return true;
+            if (lineUpper.Contains("!= ")  || lineUpper.Contains("<> ")  ||
+                lineUpper.Contains("NOT IN"))                                  return true;
+
+            return false;
+        }
+
+        private bool HasContent(List<string> lines)
+        {
+            return lines.Any(l => !string.IsNullOrWhiteSpace(l) && !l.Trim().StartsWith("--"));
+        }
+
+        private SemanticSection CreateSection(string type, List<string> lines, int start, int end)
+        {
+            return new SemanticSection
+            {
+                SectionType = type,
+                Purpose = GetSectionPurpose(type),
+                SqlText = string.Join("\n", lines).Trim(),
+                StartLine = start + 1,
+                EndLine = end
+            };
+        }
+
+        private string GetSectionPurpose(string sectionType) => sectionType switch
+        {
+            "HEADER"            => "Procedure signature and variable declarations",
+            "INITIALIZATION"    => "Variable initialization and default values",
+            "VALIDATION"        => "Input validation and business rule checks",
+            "BUSINESS_RULES"    => "Decision logic and calculations",
+            "DATA_RETRIEVAL"    => "Reading existing data from tables",
+            "DATA_MODIFICATION" => "Modifying persistent data",
+            "TRANSACTION"       => "Transaction control statements",
+            "AUDIT"             => "Audit logging operations",
+            "OUTPUT"            => "Returning results to caller",
+            "CLEANUP"           => "Cleaning up temporary objects",
+            "ERROR_HANDLING"    => "Exception handling",
+            _                   => "Other"
+        };
+
+        private string BuildEmbeddingText(StructuralSignals proc, BusinessDomain domain,
+            SemanticIntent intent, string stage, List<SemanticSection> sections)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine(proc.SemanticSummary);
+            sb.AppendLine();
+            sb.AppendLine($"This procedure belongs to the {domain.DomainName} capability");
+            sb.AppendLine($"and represents the {stage.ToLower()} stage of the {domain.BusinessFlow.ToLower()} lifecycle.");
+            sb.AppendLine();
+            sb.AppendLine($"It operates primarily on {intent.PrimaryEntity}");
+            if (intent.RelatedEntities.Any())
+                sb.AppendLine($"and involves {string.Join(", ", intent.RelatedEntities)}.");
+            sb.AppendLine();
+            sb.AppendLine("Semantic sections available:");
+            foreach (var section in sections)
+                sb.AppendLine($"- {section.SectionType}: {section.Purpose}");
+            sb.AppendLine();
+            if (intent.BusinessRules.Any())
+            {
+                sb.AppendLine("Business rules enforced:");
+                foreach (var rule in intent.BusinessRules)
+                    sb.AppendLine($"- {rule}");
+            }
+            return sb.ToString().Trim();
+        }
+
+        private string GetLifecycleStage(StructuralSignals proc)
+        {
+            string name = proc.ObjectName.Replace("sp_", "");
+            int split = 1;
+            while (split < name.Length && !char.IsUpper(name[split])) split++;
+            string stage = split > 1 ? name.Substring(0, split) : name;
+            if (string.IsNullOrEmpty(stage) || stage.Length <= 1)
+                return proc.ChunkClassification switch
+                {
+                    "ARCHIVE" => "Archive", "PURGE" => "Purge", "AUDIT" => "Audit",
+                    "REPORT"  => "Generate", _ => "Process"
+                };
+            return stage;
+        }
+
+        private List<string> FindDependencies(StructuralSignals proc, List<StructuralSignals> allSignals)
+        {
+            var deps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rt in proc.ReadsFrom.Where(t => !IsInfrastructure(t)))
+                foreach (var w in allSignals
+                    .Where(o => o != proc && o.WritesTo.Contains(rt) && !o.IsReadOnly)
+                    .Select(o => o.ObjectName))
+                    deps.Add($"{w} (writes {rt})");
+            return deps.Take(10).ToList();
+        }
+
+        private bool IsInfrastructure(string t) =>
+            string.IsNullOrEmpty(t)
+            || t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase)
+            || t.StartsWith("#")
+            || t.EndsWith("_Archive")
+            || t.Length <= 3;
+    }
+
+    /// <summary>
+    /// Definition of a semantic section in the hierarchy.
+    /// </summary>
+    class SectionDefinition
+    {
+        public string Name { get; }
+        public string Purpose { get; }
+        public string[] TriggerPatterns { get; }     // Patterns that START this section
+        public string[] ExcludePatterns { get; }     // Patterns that should NOT trigger this section
+        public bool IsValidation { get; }
+        public bool IsOutput { get; }
+        public string ExcludeAfter { get; }          // Don't start this section after this pattern
+
+        public SectionDefinition(string name, string purpose, string[] triggers, string[] excludes,
+            bool isValidation = false, bool isOutput = false, string excludeAfter = null)
+        {
+            Name = name;
+            Purpose = purpose;
+            TriggerPatterns = triggers;
+            ExcludePatterns = excludes;
+            IsValidation = isValidation;
+            IsOutput = isOutput;
+            ExcludeAfter = excludeAfter;
         }
     }
 
@@ -579,7 +1486,7 @@ namespace SqlChunkerApp
                 @"\b(?:INNER|LEFT|RIGHT|FULL|CROSS)?\s*(?:OUTER\s+)?JOIN\b", RegexOptions.IgnoreCase).Count;
             signals.GroupByCount = Regex.Matches(cleaned, @"\bGROUP\s+BY\b", RegexOptions.IgnoreCase).Count;
             signals.AggregateFunctionCount = Regex.Matches(cleaned,
-                @"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", RegexOptions.IgnoreCase).Count;
+                @"\b(?:COUNT|SUM|AVG|MIN|MAX|STRING_AGG|APPROX_COUNT_DISTINCT)\s*\(", RegexOptions.IgnoreCase).Count;
             signals.OrderByCount = Regex.Matches(cleaned, @"\bORDER\s+BY\b", RegexOptions.IgnoreCase).Count;
             signals.SubqueryCount = Regex.Matches(cleaned, @"\(\s*SELECT\s+(?!1\b)\w+", RegexOptions.IgnoreCase).Count;
             signals.CteCount = Regex.Matches(rawSql, @"\bWITH\s+\w+\s+AS\s*\(", RegexOptions.IgnoreCase).Count;
@@ -660,32 +1567,62 @@ namespace SqlChunkerApp
 
     class BusinessCapabilityDiscoverer
     {
-        // ── Business capability taxonomy ──────────────────────────
-        private static readonly Dictionary<string, string[]> CapabilityVerbs = new(StringComparer.OrdinalIgnoreCase)
+        private Vocabulary ExtractVocabulary(List<StructuralSignals> procs)
         {
-            ["MemberManagement"] = new[] { "Member", "Membership" },
-            ["Lending"]          = new[] { "Loan", "Issue", "Return", "Renew", "Reserve", "Borrow" },
-            ["FineManagement"]   = new[] { "Fine", "Pay", "Waive", "Penalty", "Overdue" },
-            ["CatalogManagement"] = new[] { "Book", "Author", "Publisher", "Category", "Catalog", "ISBN", "Title" },
-            ["EmployeeManagement"] = new[] { "Employee", "Hire", "Staff", "Terminate" },
-            ["LeaveManagement"]  = new[] { "Leave", "Vacation", "Sick", "TimeOff" },
-            ["AttendanceTracking"] = new[] { "Attendance", "TimeIn", "TimeOut", "Clock" },
-            ["PayrollProcessing"] = new[] { "Payroll", "Salary", "Pay", "Compensation" },
-            ["PerformanceManagement"] = new[] { "Performance", "Review", "Appraisal", "Rating" },
-            ["TrainingDevelopment"] = new[] { "Training", "Enroll", "Course", "Certification" },
-            ["RecruitmentHiring"] = new[] { "Recruit", "Candidate", "Requisition", "Hire", "Job" },
-        };
+            var vocab = new Vocabulary();
+            foreach (var proc in procs)
+            {
+                foreach (var table in proc.WritesTo)
+                    if (IsRealTable(table)) vocab.AddNoun(table);
+                foreach (var table in proc.ReadsFrom)
+                    if (IsRealTable(table)) vocab.AddNoun(table);
+            }
+            foreach (var proc in procs)
+            {
+                string name = proc.ObjectName.Replace("sp_", "").Replace("_", "");
+                var words = SplitCamelCase(name);
+                foreach (var word in words)
+                {
+                    if (word.Length <= 2) continue;
+                    if (IsLikelyVerb(word)) vocab.AddVerb(word);
+                    else vocab.AddNoun(word);
+                }
+            }
+            foreach (var proc in procs)
+                foreach (var (table, columns) in proc.ColumnsRead)
+                    foreach (var col in columns)
+                        if (IsLikelyStateColumn(col)) vocab.AddStateColumn(col);
+            return vocab;
+        }
 
-        // ── Entity lifecycle stages ───────────────────────────────
-        private static readonly Dictionary<string, string[]> LifecycleStages = new(StringComparer.OrdinalIgnoreCase)
+        private bool IsRealTable(string t) =>
+            !string.IsNullOrEmpty(t) && !t.StartsWith("#") && !t.EndsWith("_cursor")
+            && !t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase) && t.Length > 3;
+
+        private List<string> SplitCamelCase(string name)
         {
-            ["Member"]   = new[] { "Add", "Register", "Activate", "Renew", "Expire", "Deactivate", "Terminate" },
-            ["Loan"]     = new[] { "Issue", "Checkout", "Renew", "Return", "Close", "Overdue" },
-            ["Fine"]     = new[] { "Assess", "Pay", "Waive", "Appeal", "WriteOff" },
-            ["Employee"] = new[] { "Add", "Hire", "Onboard", "Promote", "Transfer", "Terminate", "Exit" },
-            ["Leave"]    = new[] { "Submit", "Approve", "Reject", "Cancel", "Take" },
-            ["Payroll"]  = new[] { "Calculate", "Process", "Approve", "Distribute", "Close" },
-        };
+            var words = new List<string>();
+            int start = 0;
+            for (int i = 1; i < name.Length; i++)
+                if (char.IsUpper(name[i]) && !char.IsUpper(name[i - 1]))
+                { words.Add(name.Substring(start, i - start)); start = i; }
+            if (start < name.Length) words.Add(name.Substring(start));
+            return words;
+        }
+
+        private bool IsLikelyVerb(string word)
+        {
+            var suffixes = new[] { "ate", "ify", "ize", "ise", "pt", "ed", "ing" };
+            return suffixes.Any(s => word.EndsWith(s, StringComparison.OrdinalIgnoreCase)) || word.Length <= 6;
+        }
+
+        private bool IsLikelyStateColumn(string col) =>
+            col.EndsWith("Status", StringComparison.OrdinalIgnoreCase)
+            || col.EndsWith("State", StringComparison.OrdinalIgnoreCase)
+            || col.EndsWith("Date", StringComparison.OrdinalIgnoreCase)
+            || col.StartsWith("Is", StringComparison.OrdinalIgnoreCase)
+            || col.StartsWith("Has", StringComparison.OrdinalIgnoreCase)
+            || col.EndsWith("By", StringComparison.OrdinalIgnoreCase);
 
         /// <summary>
         /// Discovers business capabilities from procedure names, state patterns,
@@ -697,16 +1634,9 @@ namespace SqlChunkerApp
 
             foreach (var proc in procs)
             {
-                // Step 1: Extract business nouns and verbs from procedure name
-                var (nouns, verbs) = ParseProcedureName(proc.ObjectName);
-
-                // Step 2: Match to known business capabilities
-                string capability = MatchCapability(proc, nouns, verbs);
-
-                // Step 3: Determine lifecycle stage
-                string stage = MatchLifecycleStage(proc, nouns, verbs);
-
-                // Step 4: Find workflow neighbors (procs that share reads/writes)
+                var (entities, verbs) = ParseProcedureName(proc.ObjectName);
+                string capability = DetermineCapability(proc, entities, verbs);
+                string stage = DetermineLifecycleStage(proc, verbs);
                 var neighbors = FindWorkflowNeighbors(proc, procs);
 
                 if (!capabilities.ContainsKey(capability))
@@ -723,117 +1653,184 @@ namespace SqlChunkerApp
 
                 var cap = capabilities[capability];
                 cap.Procedures.Add(proc);
-                cap.CoreEntities.UnionWith(nouns);
+                cap.CoreEntities.UnionWith(entities);
                 if (!cap.LifecycleStages.Contains(stage))
                     cap.LifecycleStages.Add(stage);
-
                 foreach (var neighbor in neighbors)
-                {
                     cap.WorkflowEdges.Add((proc.ObjectName, neighbor.ObjectName));
-                }
             }
 
-            // Step 5: Order lifecycle stages
+            // Order lifecycle stages within each capability
             foreach (var cap in capabilities.Values)
-            {
                 cap.LifecycleOrder = OrderLifecycleStages(cap.LifecycleStages);
-            }
 
-            return capabilities;
+            // Name capabilities from their dominant entities
+            foreach (var cap in capabilities.Values)
+                cap.CapabilityName = DeriveCapabilityName(cap);
+
+            // Merge small capabilities
+            return MergeSmallCapabilities(capabilities, procs);
         }
 
-        private (List<string> nouns, List<string> verbs) ParseProcedureName(string procName)
+        private (List<string> entities, List<string> verbs) ParseProcedureName(string procName)
         {
-            // sp_AddNewEmployee → nouns: [Employee], verbs: [Add]
-            // sp_SubmitLeaveRequest → nouns: [Leave, Request], verbs: [Submit]
-            // sp_ProcessOverdueBooks → nouns: [Book], verbs: [Process]
-            
             string name = procName.Replace("sp_", "").Replace("_", "");
+            var words = SplitCamelCase(name);
             
-            var nouns = new List<string>();
+            var entities = new List<string>();
             var verbs = new List<string>();
 
-            // Known verbs
-            foreach (var verb in new[] { "Add", "Create", "Submit", "Approve", "Reject", 
-                "Process", "Generate", "Get", "Search", "Update", "Delete", "Terminate",
-                "Issue", "Return", "Renew", "Reserve", "Pay", "Waive", "Transfer",
-                "Record", "Enroll", "Bulk", "Calculate" })
+            // First pass: use extracted vocabulary to classify words
+            var vocab = new Vocabulary(); // We'll inject this properly
+            foreach (var word in words)
             {
-                if (name.StartsWith(verb, StringComparison.OrdinalIgnoreCase))
-                {
-                    verbs.Add(verb);
-                    name = name.Substring(verb.Length);
-                    break;
-                }
+                if (word.Length <= 2) continue;
+                if (IsLikelyVerb(word))
+                    verbs.Add(word);
+                else
+                    entities.Add(word);
             }
 
-            // Known entity nouns
-            foreach (var noun in new[] { "Employee", "Member", "Book", "Loan", "Fine", 
-                "Payment", "Leave", "Request", "Attendance", "Payroll", "Performance",
-                "Review", "Training", "Candidate", "Recruitment", "Reservation",
-                "Membership", "Author", "Publisher", "Category", "Department",
-                "Position", "Staff", "Dashboard", "Report", "Statement", "History",
-                "Inventory", "Audit", "Record" })
+            // If no verbs found, first word is likely the verb
+            if (!verbs.Any() && words.Count > 0)
             {
-                if (name.Contains(noun, StringComparison.OrdinalIgnoreCase))
-                {
-                    nouns.Add(noun);
-                }
+                verbs.Add(words[0]);
+                words.RemoveAt(0);
+                foreach (var w in words)
+                    if (w.Length > 2 && !verbs.Contains(w))
+                        entities.Add(w);
             }
 
-            return (nouns, verbs);
+            if (!entities.Any())
+                entities.Add("General");
+
+            return (entities, verbs);
         }
 
-        private string MatchCapability(StructuralSignals proc, List<string> nouns, List<string> verbs)
+        private string DeriveCapabilityName(BusinessCapability cap)
         {
-            // Try noun matching first (most specific)
-            foreach (var noun in nouns)
-            {
-                foreach (var (capability, keywords) in CapabilityVerbs)
-                {
-                    if (keywords.Any(k => k.Equals(noun, StringComparison.OrdinalIgnoreCase) ||
-                                        noun.Contains(k, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        return capability;
-                    }
-                }
-            }
+            string entity = cap.CoreEntities
+                .OrderByDescending(e => cap.Procedures.Count(p => 
+                    p.ObjectName.Contains(e, StringComparison.OrdinalIgnoreCase)))
+                .FirstOrDefault() ?? "General";
 
-            // Fall back to verb matching
-            foreach (var verb in verbs)
-            {
-                foreach (var (capability, keywords) in CapabilityVerbs)
-                {
-                    if (keywords.Any(k => k.Equals(verb, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        return capability;
-                    }
-                }
-            }
-
-            // Fall back to write-target-based naming
-            string primaryTable = proc.WritesTo
-                .FirstOrDefault(t => !t.Equals("AuditLog") && !t.StartsWith("#") && t.Length > 3);
+            var procNames = cap.Procedures.Select(p => p.ObjectName).ToList();
             
-            return primaryTable != null ? $"{primaryTable}Management" : "GeneralOperations";
+            if (procNames.Any(n => n.Contains("Process") || n.Contains("Calculate")))
+                return $"{entity}Processing";
+            if (procNames.Any(n => n.Contains("Track") || n.Contains("Record") || n.Contains("Attend")))
+                return $"{entity}Tracking";
+            if (procNames.Any(n => n.Contains("Review") || n.Contains("Perform") || n.Contains("Apprais")))
+                return $"{entity}Evaluation";
+            if (procNames.Any(n => n.Contains("Train") || n.Contains("Enroll") || n.Contains("Learn")))
+                return $"{entity}Development";
+            if (procNames.Any(n => n.Contains("Leave") || n.Contains("Request") || n.Contains("Approve")))
+                return $"{entity}Management";
+            if (procNames.Any(n => n.Contains("Pay") || n.Contains("Salary") || n.Contains("Compens")))
+                return $"{entity}Processing";
+            
+            return $"{entity}Management";
         }
 
-        private string MatchLifecycleStage(StructuralSignals proc, List<string> nouns, List<string> verbs)
+        private Dictionary<string, BusinessCapability> MergeSmallCapabilities(
+            Dictionary<string, BusinessCapability> capabilities, List<StructuralSignals> allProcs)
         {
-            foreach (var noun in nouns)
+            var merged = new Dictionary<string, BusinessCapability>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (name, cap) in capabilities)
             {
-                if (LifecycleStages.TryGetValue(noun, out var stages))
+                if (cap.Procedures.Count >= 2)
                 {
-                    foreach (var verb in verbs)
-                    {
-                        var match = stages.FirstOrDefault(s => 
-                            s.Equals(verb, StringComparison.OrdinalIgnoreCase));
-                        if (match != null) return match;
-                    }
+                    merged[name] = cap;
                 }
             }
+
+            foreach (var (name, cap) in capabilities)
+            {
+                if (cap.Procedures.Count >= 2) continue;
+                var proc = cap.Procedures[0];
+
+                var bestMatch = merged.Values
+                    .Where(m => m.Procedures.Any())
+                    .OrderByDescending(m =>
+                        m.Procedures.SelectMany(p => p.ReadsFrom)
+                            .Intersect(proc.ReadsFrom, StringComparer.OrdinalIgnoreCase)
+                            .Count(t => IsRealTable(t)))
+                    .FirstOrDefault();
+
+                if (bestMatch != null)
+                {
+                    var overlap = bestMatch.Procedures
+                        .SelectMany(p => p.ReadsFrom)
+                        .Intersect(proc.ReadsFrom, StringComparer.OrdinalIgnoreCase)
+                        .Count(t => IsRealTable(t));
+
+                    if (overlap >= 2 || proc.ChunkClassification == "REPORT")
+                    {
+                        bestMatch.Procedures.Add(proc);
+                        bestMatch.CoreEntities.UnionWith(cap.CoreEntities);
+                        continue;
+                    }
+                }
+
+                if (proc.IsReadOnly || proc.ChunkClassification == "REPORT")
+                {
+                    if (!merged.ContainsKey("Reporting"))
+                        merged["Reporting"] = new BusinessCapability { CapabilityName = "Reporting" };
+                    merged["Reporting"].Procedures.Add(proc);
+                    merged["Reporting"].CoreEntities.UnionWith(cap.CoreEntities);
+                    continue;
+                }
+
+                if (proc.ChunkClassification is "ARCHIVE" or "PURGE" or "AUDIT")
+                {
+                    if (!merged.ContainsKey("Maintenance"))
+                        merged["Maintenance"] = new BusinessCapability { CapabilityName = "Maintenance" };
+                    merged["Maintenance"].Procedures.Add(proc);
+                    merged["Maintenance"].CoreEntities.UnionWith(cap.CoreEntities);
+                    continue;
+                }
+
+                merged[name] = cap;
+            }
+
+            return merged;
+        }
+
+        private string DetermineCapability(StructuralSignals proc, List<string> entities, List<string> verbs)
+        {
+            // Use primary entity from procedure name
+            if (entities.Any(e => !e.Equals("General")))
+                return entities.First(e => !e.Equals("General"));
+
+            // Use primary write target
+            string primaryWrite = proc.WritesTo
+                .FirstOrDefault(t => IsRealTable(t));
             
-            return verbs.FirstOrDefault() ?? "Process";
+            if (primaryWrite != null)
+            {
+                foreach (var suffix in new[] { "s", "es", "ies", "Requests", "Reviews", "Records" })
+                    if (primaryWrite.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+                        && primaryWrite.Length - suffix.Length >= 4)
+                        return primaryWrite.Substring(0, primaryWrite.Length - suffix.Length);
+                return primaryWrite;
+            }
+
+            return proc.IsReadOnly ? "Reporting" : "General";
+        }
+
+        private string DetermineLifecycleStage(StructuralSignals proc, List<string> verbs)
+        {
+            if (verbs.Any()) return verbs[0];
+            return proc.ChunkClassification switch
+            {
+                "ARCHIVE" => "Archive",
+                "PURGE" => "Purge",
+                "AUDIT" => "Audit",
+                "REPORT" => "Generate",
+                "LOOKUP" => "Get",
+                _ => "Process"
+            };
         }
 
         private List<StructuralSignals> FindWorkflowNeighbors(StructuralSignals proc, List<StructuralSignals> allProcs)
@@ -865,30 +1862,58 @@ namespace SqlChunkerApp
 
         private string OrderLifecycleStages(List<string> stages)
         {
-            var orderedStages = new[] { 
-                "Add", "Register", "Create", "Submit", "Record", "Enroll",
-                "Issue", "Checkout", "Reserve",
-                "Approve", "Process", "Calculate", "Generate",
-                "Renew", "Update", "Transfer", "Promote",
-                "Return", "Close", "Pay", "Waive",
-                "Expire", "Deactivate", "Terminate", "Exit", "Cancel", "Reject",
-                "Delete", "Purge", "Archive"
-            };
-
-            return string.Join(" → ", stages
-                .OrderBy(s => Array.IndexOf(orderedStages, s))
-                .Distinct());
+            if (stages.Count <= 1) return stages.FirstOrDefault() ?? "Process";
+            
+            // Simple ordering: "create" verbs before "update" before "delete/archive"
+            var create = stages.Where(s => 
+                s.StartsWith("Add") || s.StartsWith("Create") || s.StartsWith("Submit") 
+                || s.StartsWith("Record") || s.StartsWith("Enroll") || s.StartsWith("Issue")
+                || s.StartsWith("Reserve")).ToList();
+            
+            var process = stages.Where(s =>
+                s.StartsWith("Approve") || s.StartsWith("Process") || s.StartsWith("Calculate")
+                || s.StartsWith("Generate") || s.StartsWith("Renew") || s.StartsWith("Update")
+                || s.StartsWith("Transfer") || s.StartsWith("Pay")).ToList();
+            
+            var close = stages.Where(s =>
+                s.StartsWith("Return") || s.StartsWith("Close") || s.StartsWith("Waive")
+                || s.StartsWith("Terminate") || s.StartsWith("Delete") || s.StartsWith("Purge")
+                || s.StartsWith("Archive") || s.StartsWith("Expire") || s.StartsWith("Cancel")
+                || s.StartsWith("Reject")).ToList();
+            
+            var ordered = new List<string>();
+            ordered.AddRange(create);
+            ordered.AddRange(process);
+            ordered.AddRange(close);
+            ordered.AddRange(stages.Where(s => !ordered.Contains(s)));
+            
+            return string.Join(" → ", ordered.Distinct());
         }
     }
 
     class BusinessCapability
     {
         public string CapabilityName { get; set; }
-        public List<string> LifecycleStages { get; set; }
+        public List<string> LifecycleStages { get; set; } = new();
         public string LifecycleOrder { get; set; }
-        public List<StructuralSignals> Procedures { get; set; }
-        public HashSet<string> CoreEntities { get; set; }
-        public List<(string from, string to)> WorkflowEdges { get; set; }
+        public List<StructuralSignals> Procedures { get; set; } = new();
+        public HashSet<string> CoreEntities { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<(string from, string to)> WorkflowEdges { get; set; } = new();
+    }
+
+    class Vocabulary
+    {
+        private readonly HashSet<string> _verbs = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _nouns = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _stateColumns = new(StringComparer.OrdinalIgnoreCase);
+
+        public void AddVerb(string word) => _verbs.Add(word);
+        public void AddNoun(string word) => _nouns.Add(word);
+        public void AddStateColumn(string col) => _stateColumns.Add(col);
+
+        public bool IsKnownVerb(string word) => _verbs.Contains(word);
+        public bool IsKnownNoun(string word) => _nouns.Contains(word);
+        public bool IsStateColumn(string col) => _stateColumns.Contains(col);
     }
 
     static class SignalDiagnostics
@@ -984,17 +2009,31 @@ namespace SqlChunkerApp
 
         private static string GetLifecycleStage(StructuralSignals proc)
         {
-            // Extract verb from procedure name
+            // Extract first word after "sp_" as the verb
             string name = proc.ObjectName.Replace("sp_", "");
-            foreach (var verb in new[] { "Add", "Create", "Submit", "Approve", "Reject",
-                "Process", "Generate", "Get", "Search", "Update", "Delete", "Terminate",
-                "Issue", "Return", "Renew", "Reserve", "Pay", "Waive", "Transfer",
-                "Record", "Enroll", "Bulk", "Calculate" })
+            
+            // Split camelCase to get the first word (verb)
+            int firstUpper = 1;
+            while (firstUpper < name.Length && !char.IsUpper(name[firstUpper]))
+                firstUpper++;
+            
+            string verb = firstUpper > 1 ? name.Substring(0, firstUpper) : name;
+            
+            // Use classification as fallback
+            if (string.IsNullOrEmpty(verb) || verb.Length <= 1)
             {
-                if (name.StartsWith(verb, StringComparison.OrdinalIgnoreCase))
-                    return verb;
+                return proc.ChunkClassification switch
+                {
+                    "ARCHIVE" => "Archive",
+                    "PURGE" => "Purge",
+                    "AUDIT" => "Audit",
+                    "REPORT" => "Generate",
+                    "LOOKUP" => "Get",
+                    _ => "Execute"
+                };
             }
-            return "Execute";
+            
+            return verb;
         }
 
         private static int GetStageOrder(StructuralSignals proc, string lifecycle)
@@ -1063,13 +2102,35 @@ namespace SqlChunkerApp
             // ── Print domain clusters ─────────────────────────────
             PrintDomainClusters(domains);
 
-            // ── Save domains to JSON ──────────────────────────────
-            var domainsJson = JsonSerializer.Serialize(domains,
-                new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
-            File.WriteAllText(domainsPath, domainsJson);
-            Console.WriteLine($"Domains saved → {domainsPath}");
+            // ── Emit RAG chunks ─────────────────────────────────────
+            // ── Emit semantic section chunks ─────────────────────────
+            var sectionChunker = new SemanticSectionChunker();
+            // Should be:
+            var chunks = new List<SemanticChunk>();  // ← SemanticChunk, not RagChunk
+            foreach (var domain in domains)
+            {
+                foreach (var proc in domain.Procedures)
+                {
+                    var chunk = sectionChunker.ChunkProcedure(proc, domain, allSignals);
+                    chunks.Add(chunk);
+                }
+            }
 
-            Console.WriteLine($"\nDone! {allSignals.Count} signals → {domains.Count} domains");
+
+            // After the foreach loop that builds chunks:
+            foreach (var chunk in chunks)
+            {
+                Console.WriteLine($"  {chunk.Id}: {chunk.Sections.Count} sections");
+                foreach (var s in chunk.Sections)
+                    Console.WriteLine($"    {s.SectionType} (lines {s.StartLine}-{s.EndLine})");
+            }
+
+            // ── Save chunks ─────────────────────────────────────────
+            string chunksPath = @"C:\Users\Erwin\Desktop\rag_system\codebase_rag\t-sql\shared_data\semantic_chunks.json";
+            var chunksJson = JsonSerializer.Serialize(chunks,
+                new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+            File.WriteAllText(chunksPath, chunksJson);
+            Console.WriteLine($"Semantic chunks saved → {chunksPath} ({chunks.Count} chunks)");
         }
     }
 }
