@@ -267,7 +267,7 @@ namespace SqlChunkerApp
                     return "ARCHIVE";
 
                 // ── REPORT: read-only, returns data ────────────────────
-                if (IsReadOnly && (SelectStatementCount > 0 || DistinctTableCount >= 2))
+                if ((IsReadOnly || WritesOnlyToAuditLog) && (SelectStatementCount > 0 || DistinctTableCount >= 2))
                     return "REPORT";
 
                 // ── PURGE ──────────────────────────────────────────────
@@ -717,7 +717,8 @@ namespace SqlChunkerApp
     class SemanticSection
     {
         public string SectionType { get; set; }       // HEADER, VALIDATION, BUSINESS_RULES, etc.
-        public string Purpose { get; set; }            // Human-readable description
+        public string Purpose { get; set; }    
+        public string Summary { get; set; }        // Human-readable description
         public string SqlText { get; set; }            // The SQL code for this section
         public int StartLine { get; set; }
         public int EndLine { get; set; }
@@ -734,71 +735,47 @@ namespace SqlChunkerApp
         public List<SemanticSection> Sections { get; set; }  // ← ONLY this, no "Sql" property
     }
 
-    /// <summary>
-    /// Chunks a stored procedure into semantic sections based on SQL intent.
-    /// Walks the SQL line by line, detecting transitions between logical sections.
-    /// </summary>
     class SemanticSectionChunker
     {
-        private List<SemanticSection> MergeRelatedSections(List<SemanticSection> sections)
+        private static readonly HashSet<string> SqlReservedWords = new(StringComparer.OrdinalIgnoreCase)
         {
-            if (sections.Count <= 1) return sections;
+            "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL",
+            "INSERT", "UPDATE", "DELETE", "INTO", "VALUES", "SET", "AS", "ON",
+            "JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "CROSS", "FULL",
+            "CREATE", "ALTER", "DROP", "TABLE", "VIEW", "PROCEDURE", "FUNCTION",
+            "BEGIN", "END", "IF", "ELSE", "THEN", "CASE", "WHEN",
+            "DECLARE", "EXEC", "EXECUTE", "RETURN", "PRINT", "RAISERROR", "THROW",
+            "COMMIT", "ROLLBACK", "TRANSACTION", "TRAN", "TRY", "CATCH",
+            "TOP", "DISTINCT", "GROUP", "HAVING", "ORDER", "BY", "ASC", "DESC",
+            "COUNT", "SUM", "AVG", "MIN", "MAX", "EXISTS", "BETWEEN", "LIKE",
+            "UNION", "ALL", "OFFSET", "FETCH", "NEXT", "ROWS", "ONLY",
+            "SCOPE", "IDENTITY", "NOCOUNT", "READONLY", "OUTPUT"
+        };
 
-            var merged = new List<SemanticSection>();
-            merged.Add(sections[0]);
+        private bool IsReservedWord(string token) =>
+            SqlReservedWords.Contains(token) || token.StartsWith("@") || token.StartsWith("#");
 
-            for (int i = 1; i < sections.Count; i++)
-            {
-                var current = sections[i];
-                var last = merged[merged.Count - 1];
-
-                // Rule 1: Same type → always merge
-                if (last.SectionType == current.SectionType)
-                {
-                    last.SqlText += "\n" + current.SqlText;
-                    last.EndLine = current.EndLine;
-                    continue;
-                }
-
-                // Rule 2: These types always merge together (they're part of validation)
-                var validationTypes = new HashSet<string> { "VALIDATION", "INITIALIZATION", "BUSINESS_RULES" };
-                if (validationTypes.Contains(last.SectionType) && validationTypes.Contains(current.SectionType))
-                {
-                    last.SectionType = "VALIDATION";
-                    last.Purpose = "Input validation and business rule checks";
-                    last.SqlText += "\n" + current.SqlText;
-                    last.EndLine = current.EndLine;
-                    continue;
-                }
-
-                // Rule 3: Short sections (≤2 lines) get absorbed into next
-                if (last.SqlText.Split('\n').Length <= 2)
-                {
-                    current.SqlText = last.SqlText + "\n" + current.SqlText;
-                    current.StartLine = last.StartLine;
-                    merged.RemoveAt(merged.Count - 1);
-                    merged.Add(current);
-                    continue;
-                }
-
-                merged.Add(current);
-            }
-
-            return merged;
+        private List<string> SplitCamelCase(string name)
+        {
+            var words = new List<string>();
+            int start = 0;
+            for (int i = 1; i < name.Length; i++)
+                if (char.IsUpper(name[i]) && !char.IsUpper(name[i - 1]))
+                { words.Add(name.Substring(start, i - start)); start = i; }
+            if (start < name.Length) words.Add(name.Substring(start));
+            return words;
         }
 
-        public SemanticChunk ChunkProcedure(
-            StructuralSignals proc,
-            BusinessDomain domain,
-            List<StructuralSignals> allSignals)
+        // ═══════════════════════════════════════════════════════════
+        // PUBLIC
+        // ═══════════════════════════════════════════════════════════
+
+        public SemanticChunk ChunkProcedure(StructuralSignals proc, BusinessDomain domain, List<StructuralSignals> allSignals)
         {
             var intent = SemanticIntentExtractor.Extract(proc);
             var stage = GetLifecycleStage(proc);
-            var sections = SplitIntoSections(proc.RawSql);
+            var sections = SplitIntoSections(proc.RawSql, proc);
             sections = MergeRelatedSections(sections);
-            Console.WriteLine($"  After merge: {sections.Count} sections");
-            foreach (var s in sections)
-                Console.WriteLine($"    {s.SectionType} (lines {s.StartLine}-{s.EndLine})");
 
             return new SemanticChunk
             {
@@ -822,11 +799,14 @@ namespace SqlChunkerApp
             };
         }
 
-        private List<SemanticSection> SplitIntoSections(string sql)
+        // ═══════════════════════════════════════════════════════════
+        // SECTION SPLITTING
+        // ═══════════════════════════════════════════════════════════
+
+        private List<SemanticSection> SplitIntoSections(string sql, StructuralSignals proc)
         {
             var lines = sql.Split('\n');
             var sections = new List<SemanticSection>();
-
             string currentSection = null;
             int sectionStart = 0;
             var sectionLines = new List<string>();
@@ -837,200 +817,116 @@ namespace SqlChunkerApp
                 string lineUpper = line.ToUpperInvariant();
 
                 if (string.IsNullOrWhiteSpace(line) || line.StartsWith("--"))
-                {
-                    sectionLines.Add(lines[i]);
-                    continue;
-                }
+                { sectionLines.Add(lines[i]); continue; }
 
-                string detectedSection = ClassifyLine(lineUpper, currentSection, i, lines.Length);
+                string detected = ClassifyLine(lineUpper, currentSection, i, lines.Length);
 
-                if (detectedSection != currentSection)
+                if (detected != currentSection)
                 {
                     if (currentSection != null && HasContent(sectionLines))
-                    {
-                        sections.Add(CreateSection(currentSection, sectionLines, sectionStart, i));
-                    }
-
-                    currentSection = detectedSection;
+                        sections.Add(CreateSection(currentSection, sectionLines, sectionStart, i, proc));
+                    currentSection = detected;
                     sectionStart = i;
                     sectionLines = new List<string> { lines[i] };
                 }
-                else
-                {
-                    sectionLines.Add(lines[i]);
-                }
+                else sectionLines.Add(lines[i]);
             }
 
             if (currentSection != null && HasContent(sectionLines))
-            {
-                sections.Add(CreateSection(currentSection, sectionLines, sectionStart, lines.Length));
-            }
+                sections.Add(CreateSection(currentSection, sectionLines, sectionStart, lines.Length, proc));
 
             return sections;
         }
 
         private string ClassifyLine(string lineUpper, string currentSection, int lineIndex, int totalLines)
         {
-            // ── 1. HEADER ──────────────────────────────────────────────────────────────
             if (lineUpper.StartsWith("CREATE PROCEDURE") || lineUpper.StartsWith("CREATE PROC") ||
-                lineUpper.StartsWith("ALTER PROCEDURE")  || lineUpper.StartsWith("ALTER PROC"))
+                lineUpper.StartsWith("ALTER PROCEDURE") || lineUpper.StartsWith("ALTER PROC"))
                 return "HEADER";
 
-            // SET NOCOUNT and AS/BEGIN at the very top stay in HEADER
-            if (lineUpper.StartsWith("SET NOCOUNT") &&
-                (currentSection == "HEADER" || currentSection == null))
+            if (lineUpper.StartsWith("SET NOCOUNT") && (currentSection == "HEADER" || currentSection == null))
                 return "HEADER";
 
-            // ── 2. ERROR_HANDLING (must be checked before anything else) ──────────────
             if (lineUpper.StartsWith("BEGIN CATCH") || lineUpper.StartsWith("END CATCH") ||
                 lineUpper.Contains("ERROR_MESSAGE()") || lineUpper.Contains("ERROR_SEVERITY()") ||
                 lineUpper.Contains("ERROR_STATE()"))
                 return "ERROR_HANDLING";
 
-            if (currentSection == "ERROR_HANDLING")
-                return "ERROR_HANDLING";
+            if (currentSection == "ERROR_HANDLING") return "ERROR_HANDLING";
 
-            // ── 3. CLEANUP ─────────────────────────────────────────────────────────────
-            if (lineUpper.StartsWith("DROP TABLE") || lineUpper.StartsWith("DEALLOCATE") ||
-                lineUpper.StartsWith("CLOSE "))
+            if (lineUpper.StartsWith("DROP TABLE") || lineUpper.StartsWith("DEALLOCATE") || lineUpper.StartsWith("CLOSE "))
                 return "CLEANUP";
 
-            // ── 4. TRANSACTION ─────────────────────────────────────────────────────────
             if (lineUpper.StartsWith("BEGIN TRANSACTION") || lineUpper.StartsWith("BEGIN TRAN ") ||
-                lineUpper == "BEGIN TRAN"                 ||
-                lineUpper.StartsWith("COMMIT")            || lineUpper.StartsWith("ROLLBACK"))
+                lineUpper == "BEGIN TRAN" || lineUpper.StartsWith("COMMIT") || lineUpper.StartsWith("ROLLBACK"))
                 return "TRANSACTION";
 
-            // ── 5. AUDIT ───────────────────────────────────────────────────────────────
-            if (lineUpper.Contains("AUDITLOG") &&
-                (lineUpper.Contains("INSERT") || lineUpper.Contains("VALUES")))
+            if (lineUpper.Contains("AUDITLOG") && (lineUpper.Contains("INSERT") || lineUpper.Contains("VALUES")))
                 return "AUDIT";
+            if (currentSection == "AUDIT" && lineUpper.StartsWith("VALUES")) return "AUDIT";
 
-            if (currentSection == "AUDIT" && lineUpper.StartsWith("VALUES"))
-                return "AUDIT";
+            if (lineUpper.StartsWith("BEGIN TRY")) return "VALIDATION";
 
-            // ── 6. BEGIN TRY → VALIDATION ──────────────────────────────────────────────
-            if (lineUpper.StartsWith("BEGIN TRY"))
-                return "VALIDATION";
-
-            // ── 7. INITIALIZATION ──────────────────────────────────────────────────────
-            // DECLARE always means initialization (variable setup), regardless of section.
-            // Exception: the very first DECLARE block before BEGIN TRY belongs to HEADER
-            // only if currentSection is still HEADER.  Once we've seen BEGIN TRY (VALIDATION),
-            // all DECLAREs are mid-body initialization.
             if (lineUpper.StartsWith("DECLARE @"))
-            {
-                // Before BEGIN TRY → these are proc-level declarations, keep in HEADER
-                if (currentSection == "HEADER" || currentSection == null)
-                    return "HEADER";
-                // Inside the body → INITIALIZATION
-                return "INITIALIZATION";
-            }
+                return (currentSection == "HEADER" || currentSection == null) ? "HEADER" : "INITIALIZATION";
 
-            // SET @var and SELECT @var = ... are initialization when we haven't started DML yet
-            bool beforeFirstDml =
-                currentSection == "VALIDATION"    ||
-                currentSection == "INITIALIZATION" ||
-                currentSection == "TRANSACTION"   ||   // ← was missing; covers SELECT @var after BEGIN TRAN
-                currentSection == "HEADER"        ||
-                currentSection == null;
+            bool beforeFirstDml = currentSection == "VALIDATION" || currentSection == "INITIALIZATION" ||
+                                currentSection == "TRANSACTION" || currentSection == "HEADER" || currentSection == null;
 
             if ((lineUpper.StartsWith("SET @") || lineUpper.StartsWith("SELECT @")) && beforeFirstDml)
                 return "INITIALIZATION";
 
-            // ── 8. VALIDATION: explicit guard checks ───────────────────────────────────
-            if ((lineUpper.StartsWith("RAISERROR") || lineUpper.StartsWith("THROW ")) &&
-                currentSection != "ERROR_HANDLING")
+            if ((lineUpper.StartsWith("RAISERROR") || lineUpper.StartsWith("THROW ")) && currentSection != "ERROR_HANDLING")
                 return "VALIDATION";
 
-            if ((lineUpper.StartsWith("IF ") || lineUpper.StartsWith("IF(")) &&
-                IsInputValidation(lineUpper))
+            if ((lineUpper.StartsWith("IF ") || lineUpper.StartsWith("IF(")) && IsInputValidation(lineUpper))
                 return "VALIDATION";
 
-            // ── 9. DATA_MODIFICATION: real-table writes ────────────────────────────────
-            bool isDml = lineUpper.StartsWith("INSERT ")   || lineUpper.StartsWith("INSERT\t")  ||
-                        lineUpper.StartsWith("UPDATE ")   || lineUpper.StartsWith("UPDATE\t")  ||
-                        lineUpper.StartsWith("DELETE ")   || lineUpper.StartsWith("DELETE\t")  ||
-                        lineUpper.StartsWith("MERGE ");
-
-            if (isDml && !lineUpper.Contains("AUDITLOG") &&
-                !lineUpper.StartsWith("INSERT INTO #")   &&
-                !lineUpper.StartsWith("INSERT  INTO #")  &&
-                !lineUpper.StartsWith("UPDATE #"))
+            if ((lineUpper.StartsWith("INSERT ") || lineUpper.StartsWith("UPDATE ") ||
+                lineUpper.StartsWith("DELETE ") || lineUpper.StartsWith("MERGE ")) && !lineUpper.Contains("AUDITLOG"))
                 return "DATA_MODIFICATION";
 
-            // Temp-table INSERT = staging setup → INITIALIZATION
             if (lineUpper.StartsWith("INSERT INTO #") || lineUpper.StartsWith("INSERT  INTO #"))
                 return "INITIALIZATION";
+            if (lineUpper.StartsWith("UPDATE #")) return "BUSINESS_RULES";
 
-            // Temp-table UPDATE = calculation loop → BUSINESS_RULES
-            if (lineUpper.StartsWith("UPDATE #"))
+            if (lineUpper.StartsWith("IF ") || lineUpper.StartsWith("IF(") || lineUpper.StartsWith("ELSE ") ||
+                lineUpper == "ELSE" || lineUpper.StartsWith("ELSE IF ") || lineUpper.StartsWith("WHILE "))
                 return "BUSINESS_RULES";
 
-            // ── 10. BUSINESS_RULES: decision logic and calculations ────────────────────
-            if (lineUpper.StartsWith("IF ")    || lineUpper.StartsWith("IF(")     ||
-                lineUpper.StartsWith("ELSE ")  || lineUpper == "ELSE"             ||
-                lineUpper.StartsWith("ELSE IF ") || lineUpper.StartsWith("WHILE "))
+            if ((lineUpper.StartsWith("SET @") || lineUpper.StartsWith("SELECT @")) && !beforeFirstDml)
                 return "BUSINESS_RULES";
 
-            // SET @var / SELECT @var after the first DML = mid-calculation assignment
-            if ((lineUpper.StartsWith("SET @") || lineUpper.StartsWith("SELECT @")) &&
-                !beforeFirstDml)
-                return "BUSINESS_RULES";
-
-            // ── 11. OUTPUT vs DATA_RETRIEVAL ───────────────────────────────────────────
-            if (lineUpper.StartsWith("SELECT ") &&
-                !lineUpper.Contains("SELECT @") &&
-                !lineUpper.Contains("SELECT 1") &&
-                !lineUpper.Contains("SELECT COUNT"))
+            if (lineUpper.StartsWith("SELECT ") && !lineUpper.Contains("SELECT @") &&
+                !lineUpper.Contains("SELECT 1") && !lineUpper.Contains("SELECT COUNT"))
             {
-                // A SELECT that comes after DML/AUDIT/TRANSACTION, or in the last third,
-                // is returning results to the caller.
-                if (currentSection == "DATA_MODIFICATION" ||
-                    currentSection == "AUDIT"             ||
-                    currentSection == "TRANSACTION"       ||
-                    lineIndex > totalLines * 0.60)
+                if (currentSection == "DATA_MODIFICATION" || currentSection == "AUDIT" ||
+                    currentSection == "TRANSACTION" || lineIndex > totalLines * 0.60)
                     return "OUTPUT";
-
                 return "DATA_RETRIEVAL";
             }
 
-            // PRINT near the end or after DML = output/logging to caller
-            if (lineUpper.StartsWith("PRINT ") &&
-                (currentSection == "DATA_MODIFICATION" ||
-                currentSection == "AUDIT"             ||
-                currentSection == "TRANSACTION"       ||
-                lineIndex > totalLines * 0.60))
+            if (lineUpper.StartsWith("PRINT ") && (currentSection == "DATA_MODIFICATION" ||
+                currentSection == "AUDIT" || currentSection == "TRANSACTION" || lineIndex > totalLines * 0.60))
                 return "OUTPUT";
 
-            // ── 12. Fall-through ───────────────────────────────────────────────────────
             return currentSection ?? "HEADER";
         }
 
         private bool IsInputValidation(string lineUpper)
         {
-            // Never treat transaction-management IFs as validation
-            if (lineUpper.Contains("@@TRANCOUNT") ||
-                lineUpper.Contains("@@ERROR")     ||
-                lineUpper.Contains("@@FETCH_STATUS"))
+            if (lineUpper.Contains("@@TRANCOUNT") || lineUpper.Contains("@@ERROR") || lineUpper.Contains("@@FETCH_STATUS"))
                 return false;
-
-            if (lineUpper.Contains("EXISTS"))                                  return true;
-            if (lineUpper.Contains("IS NULL") || lineUpper.Contains("IS NOT NULL")) return true;
-            if (lineUpper.Contains("!= ")  || lineUpper.Contains("<> ")  ||
-                lineUpper.Contains("NOT IN"))                                  return true;
-
-            return false;
+            return lineUpper.Contains("EXISTS") || lineUpper.Contains("IS NULL") || lineUpper.Contains("IS NOT NULL") ||
+                lineUpper.Contains("!= ") || lineUpper.Contains("<> ") || lineUpper.Contains("NOT IN");
         }
 
-        private bool HasContent(List<string> lines)
-        {
-            return lines.Any(l => !string.IsNullOrWhiteSpace(l) && !l.Trim().StartsWith("--"));
-        }
+        private bool HasContent(List<string> lines) =>
+            lines.Any(l => !string.IsNullOrWhiteSpace(l) && !l.Trim().StartsWith("--"));
 
-        private SemanticSection CreateSection(string type, List<string> lines, int start, int end)
+        private SemanticSection CreateSection(string type, List<string> lines, int start, int end, StructuralSignals proc)
         {
-            return new SemanticSection
+            var section = new SemanticSection
             {
                 SectionType = type,
                 Purpose = GetSectionPurpose(type),
@@ -1038,26 +934,456 @@ namespace SqlChunkerApp
                 StartLine = start + 1,
                 EndLine = end
             };
+            section.Summary = GenerateSectionSummary(section, proc);
+            return section;
         }
 
-        private string GetSectionPurpose(string sectionType) => sectionType switch
+        private string GetSectionPurpose(string type) => type switch
         {
-            "HEADER"            => "Procedure signature and variable declarations",
-            "INITIALIZATION"    => "Variable initialization and default values",
-            "VALIDATION"        => "Input validation and business rule checks",
-            "BUSINESS_RULES"    => "Decision logic and calculations",
-            "DATA_RETRIEVAL"    => "Reading existing data from tables",
+            "HEADER" => "Procedure signature and variable declarations",
+            "INITIALIZATION" => "Variable initialization and default values",
+            "VALIDATION" => "Input validation and business rule checks",
+            "BUSINESS_RULES" => "Decision logic and calculations",
+            "DATA_RETRIEVAL" => "Reading existing data from tables",
             "DATA_MODIFICATION" => "Modifying persistent data",
-            "TRANSACTION"       => "Transaction control statements",
-            "AUDIT"             => "Audit logging operations",
-            "OUTPUT"            => "Returning results to caller",
-            "CLEANUP"           => "Cleaning up temporary objects",
-            "ERROR_HANDLING"    => "Exception handling",
-            _                   => "Other"
+            "TRANSACTION" => "Transaction control statements",
+            "AUDIT" => "Audit logging operations",
+            "OUTPUT" => "Returning results to caller",
+            "CLEANUP" => "Cleaning up temporary objects",
+            "ERROR_HANDLING" => "Exception handling",
+            _ => "Other"
         };
 
-        private string BuildEmbeddingText(StructuralSignals proc, BusinessDomain domain,
-            SemanticIntent intent, string stage, List<SemanticSection> sections)
+        // ═══════════════════════════════════════════════════════════
+        // MERGING
+        // ═══════════════════════════════════════════════════════════
+
+        private List<SemanticSection> MergeRelatedSections(List<SemanticSection> sections)
+        {
+            if (sections.Count <= 1) return sections;
+            var pass1 = AbsorbSingleLineSections(sections);
+            var pass2 = MergeAdjacentSameType(pass1);
+            return MergeGloballyByType(pass2);
+        }
+
+        private List<SemanticSection> AbsorbSingleLineSections(List<SemanticSection> sections)
+        {
+            var result = new List<SemanticSection> { sections[0] };
+            for (int i = 1; i < sections.Count; i++)
+            {
+                var cur = sections[i];
+                var last = result[result.Count - 1];
+                bool lastIsSingle = last.SqlText.Split('\n').Length == 1;
+                bool lastIsStructural = last.SectionType == "DATA_MODIFICATION" || last.SectionType == "AUDIT" ||
+                                        last.SectionType == "OUTPUT" || last.SectionType == "ERROR_HANDLING";
+                if (lastIsSingle && !lastIsStructural)
+                {
+                    cur.SqlText = last.SqlText + "\n" + cur.SqlText;
+                    cur.StartLine = last.StartLine;
+                    result.RemoveAt(result.Count - 1);
+                    result.Add(cur);
+                }
+                else result.Add(cur);
+            }
+            return result;
+        }
+
+        private List<SemanticSection> MergeAdjacentSameType(List<SemanticSection> sections)
+        {
+            var merged = new List<SemanticSection> { sections[0] };
+            var validationTypes = new HashSet<string> { "VALIDATION", "INITIALIZATION", "BUSINESS_RULES" };
+            for (int i = 1; i < sections.Count; i++)
+            {
+                var cur = sections[i];
+                var last = merged[merged.Count - 1];
+                if (last.SectionType == cur.SectionType)
+                { MergeInto(last, cur); continue; }
+                if (validationTypes.Contains(last.SectionType) && validationTypes.Contains(cur.SectionType))
+                {
+                    last.SectionType = "VALIDATION";
+                    last.Purpose = "Input validation and business rule checks";
+                    MergeInto(last, cur);
+                    continue;
+                }
+                merged.Add(cur);
+            }
+            return merged;
+        }
+
+        private List<SemanticSection> MergeGloballyByType(List<SemanticSection> sections)
+        {
+            var order = new List<string>();
+            var groups = new Dictionary<string, SemanticSection>();
+            foreach (var s in sections)
+            {
+                if (!groups.TryGetValue(s.SectionType, out var existing))
+                {
+                    order.Add(s.SectionType);
+                    groups[s.SectionType] = new SemanticSection
+                    {
+                        SectionType = s.SectionType, Purpose = s.Purpose,
+                        Summary = s.Summary, SqlText = s.SqlText,
+                        StartLine = s.StartLine, EndLine = s.EndLine
+                    };
+                }
+                else MergeInto(existing, s);
+            }
+            return order.Select(t => groups[t]).ToList();
+        }
+
+        private void MergeInto(SemanticSection target, SemanticSection incoming)
+        {
+            target.SqlText += "\n" + incoming.SqlText;
+            target.StartLine = Math.Min(target.StartLine, incoming.StartLine);
+            target.EndLine = Math.Max(target.EndLine, incoming.EndLine);
+            target.Summary = JoinSummaries(target.Summary, incoming.Summary);
+        }
+
+        private string JoinSummaries(string a, string b)
+        {
+            if (string.IsNullOrWhiteSpace(a)) return b;
+            if (string.IsNullOrWhiteSpace(b)) return a;
+            if (a.Equals(b, StringComparison.OrdinalIgnoreCase)) return a;
+            var existing = new HashSet<string>(a.Split(';').Select(x => x.Trim()), StringComparer.OrdinalIgnoreCase);
+            var added = b.Split(';').Select(x => x.Trim()).Where(x => x.Length > 0 && !existing.Contains(x));
+            return added.Any() ? a + "; " + string.Join("; ", added) : a;
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // SUMMARIZERS (AST-based)
+        // ═══════════════════════════════════════════════════════════
+
+        private string GenerateSectionSummary(SemanticSection section, StructuralSignals proc)
+        {
+            string sql = section.SqlText;
+            return section.SectionType switch
+            {
+                "HEADER"            => SummarizeHeader(sql, proc),
+                "VALIDATION"        => SummarizeValidation(sql),
+                "DATA_MODIFICATION" => SummarizeModification(sql),
+                "AUDIT"             => SummarizeAudit(sql),
+                "TRANSACTION"       => SummarizeTransaction(sql),
+                "OUTPUT"            => SummarizeOutput(sql),
+                "DATA_RETRIEVAL"    => SummarizeRetrieval(sql),
+                "ERROR_HANDLING"    => SummarizeErrorHandling(sql),
+                "CLEANUP"           => SummarizeCleanup(sql),
+                "INITIALIZATION"    => SummarizeInitialization(sql),
+                "BUSINESS_RULES"    => SummarizeBusinessRules(sql),
+                _                   => section.Purpose
+            };
+        }
+
+        private string SummarizeHeader(string sql, StructuralSignals proc)
+        {
+            var parts = new List<string>();
+            string entity = GetBusinessEntity(proc);
+            string verb = GetOperationVerb(proc);
+            parts.Add($"{verb} {entity}");
+            var inputs = ExtractKeyInputs(sql);
+            if (inputs.Any()) parts.Add($"requires {string.Join(", ", inputs.Take(4))}");
+            if (proc.OutputParameters.Any()) parts.Add($"returns new {entity} identifier");
+            return string.Join("; ", parts);
+        }
+
+        private string SummarizeValidation(string sql)
+        {
+            var p = new TSql160Parser(true);
+            var f = p.Parse(new StringReader(sql), out IList<ParseError> e);
+            if (e.Any() || f == null) return "validates input";
+            var x = new ValidationRuleExtractor();
+            f.Accept(x);
+            return x.BuildSummary();
+        }
+
+        private string SummarizeModification(string sql)
+        {
+            var p = new TSql160Parser(true);
+            var f = p.Parse(new StringReader(sql), out IList<ParseError> e);
+            if (e.Any() || f == null) return "modifies data";
+            var x = new BusinessOperationExtractor();
+            f.Accept(x);
+            return x.BuildSummary();
+        }
+
+        private string SummarizeAudit(string sql)
+        {
+            var p = new TSql160Parser(true);
+            var f = p.Parse(new StringReader(sql), out IList<ParseError> e);
+            if (e.Any() || f == null) return "logs operation";
+            var x = new AuditDetailExtractor();
+            f.Accept(x);
+            return x.BuildSummary();
+        }
+
+        private string SummarizeTransaction(string sql)
+        {
+            if (sql.Contains("COMMIT")) return "commits changes";
+            if (sql.Contains("ROLLBACK")) return "rolls back on failure";
+            if (sql.Contains("BEGIN")) return "starts atomic operation";
+            return "controls transaction";
+        }
+
+        private string SummarizeOutput(string sql)
+        {
+            if (sql.Contains("PRINT"))
+            {
+                if (sql.Contains("success") || sql.Contains("complete")) return "confirms successful completion";
+                return "reports status to caller";
+            }
+            if (sql.Contains("COUNT(*)") || sql.Contains("SUM(")) return "returns summary statistics";
+            if (sql.Contains("GROUP BY")) return "returns aggregated report";
+            if (sql.Contains("ORDER BY")) return "returns sorted results";
+            return "returns query results";
+        }
+
+        private string SummarizeRetrieval(string sql)
+        {
+            var tables = Regex.Matches(sql, @"\bFROM\s+(\w+)", RegexOptions.IgnoreCase)
+                .Cast<Match>().Select(m => m.Groups[1].Value)
+                .Where(t => !IsReservedWord(t) && !t.StartsWith("#")).Distinct().ToList();
+            if (tables.Any() && tables.Count <= 3) return $"reads {string.Join(", ", tables.Select(Humanize))}";
+            if (tables.Any()) return $"reads {tables.Count} tables";
+            return "retrieves data";
+        }
+
+        private string SummarizeErrorHandling(string sql)
+        {
+            if (sql.Contains("ROLLBACK") && sql.Contains("@@TRANCOUNT")) return "undoes changes and reports error";
+            if (sql.Contains("ROLLBACK")) return "reverts changes on error";
+            return "handles errors";
+        }
+
+        private string SummarizeCleanup(string sql)
+        {
+            if (sql.Contains("DROP TABLE")) return "removes temporary storage";
+            if (sql.Contains("DEALLOCATE")) return "releases cursor resources";
+            return "releases resources";
+        }
+
+        private string SummarizeInitialization(string sql)
+        {
+            var a = new List<string>();
+            if (sql.Contains("GETDATE()")) a.Add("sets current date");
+            if (sql.Contains("MAX(")) a.Add("generates next sequence number");
+            if (sql.Contains("COUNT(*)")) a.Add("counts records");
+            return a.Any() ? string.Join("; ", a) : "initializes variables";
+        }
+
+        private string SummarizeBusinessRules(string sql)
+        {
+            if (sql.Contains("SCOPE_IDENTITY()")) return "captures generated record identity";
+            if (sql.Contains("CASE")) return "evaluates conditional logic";
+            if (sql.Contains("ELSE")) return "branches on conditions";
+            return "applies business logic";
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // BUSINESS ENTITY HELPERS
+        // ═══════════════════════════════════════════════════════════
+
+        private string GetBusinessEntity(StructuralSignals proc)
+        {
+            string name = proc.ObjectName.Replace("sp_", "").Replace("_", "");
+            var words = SplitCamelCase(name);
+            var entity = string.Join(" ", words.Skip(1).Where(w => w.Length > 2)).ToLower();
+            if (!string.IsNullOrEmpty(entity) && entity != "new") return entity;
+            var pw = proc.WritesTo.FirstOrDefault(t => IsRealTable(t));
+            return pw != null ? Humanize(pw) : "record";
+        }
+
+        private string GetOperationVerb(StructuralSignals proc)
+        {
+            string name = proc.ObjectName.Replace("sp_", "").Replace("_", "");
+            var words = SplitCamelCase(name);
+            string w = words.FirstOrDefault()?.ToLower() ?? "";
+            return w switch
+            {
+                "add" or "create" or "insert" => "creates", "update" or "modify" or "change" => "updates",
+                "delete" or "remove" or "purge" => "removes", "terminate" or "deactivate" => "deactivates",
+                "approve" => "approves", "reject" => "rejects", "submit" => "submits",
+                "process" or "calculate" => "processes", "generate" or "report" => "generates",
+                "get" or "retrieve" or "search" => "retrieves", "record" or "log" => "records",
+                "enroll" or "register" => "registers", "transfer" or "move" => "transfers",
+                "issue" or "checkout" => "issues", "return" => "returns", "renew" => "renews",
+                "reserve" => "reserves", "pay" => "processes payment for", "waive" => "waives",
+                "bulk" when words.Count > 1 => $"{words[1].ToLower()}s in bulk",
+                _ => "manages"
+            };
+        }
+
+        private List<string> ExtractKeyInputs(string sql)
+        {
+            var p = new TSql160Parser(true);
+            var f = p.Parse(new StringReader(sql), out IList<ParseError> e);
+            if (e.Any() || f == null) return new List<string>();
+            var x = new ParameterNameExtractor();
+            f.Accept(x);
+            return x.Parameters.Where(p => !p.Contains("Error") && !p.Contains("Msg") && !p.StartsWith("New"))
+                .Take(4).Select(p => p.Replace("@", "")).Select(HumanizeColumn).ToList();
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // NESTED VISITORS
+        // ═══════════════════════════════════════════════════════════
+
+        class ValidationRuleExtractor : TSqlFragmentVisitor
+        {
+            private readonly List<string> _rules = new();
+            public override void Visit(BooleanComparisonExpression node)
+            {
+                string col = GetColumnName(node.FirstExpression);
+                string val = GetExpressionText(node.SecondExpression);
+                if (!string.IsNullOrEmpty(col))
+                {
+                    if (node.ComparisonType == BooleanComparisonType.LessThan) _rules.Add($"ensures {HumanizeColumn(col)} below {val}");
+                    else if (node.ComparisonType == BooleanComparisonType.GreaterThan) _rules.Add($"ensures {HumanizeColumn(col)} exceeds {val}");
+                    else if (node.ComparisonType == BooleanComparisonType.Equals && val.Contains("@")) _rules.Add($"matches {HumanizeColumn(col)} to input");
+                }
+                base.Visit(node);
+            }
+            public override void Visit(ExistsPredicate node) { _rules.Add("verifies record exists"); base.Visit(node); }
+            public override void Visit(LikePredicate node) { _rules.Add($"validates format of {HumanizeColumn(GetColumnName(node.FirstExpression))}"); base.Visit(node); }
+            public override void Visit(InPredicate node) { _rules.Add($"validates {HumanizeColumn(GetColumnName(node.Expression))} is allowed value"); base.Visit(node); }
+            public override void Visit(BooleanIsNullExpression node) { _rules.Add($"checks {HumanizeColumn(GetColumnName(node.Expression))} is provided"); base.Visit(node); }
+            public string BuildSummary() => _rules.Any() ? string.Join("; ", _rules.Distinct().Take(6)) : "validates input";
+        }
+
+        class BusinessOperationExtractor : TSqlFragmentVisitor
+        {
+            private readonly List<string> _ops = new();
+            public override void Visit(InsertStatement node)
+            {
+                string t = GetTableName(node.InsertSpecification?.Target);
+                if (IsBusinessTable(t)) _ops.Add($"creates {Humanize(t)} record");
+                base.Visit(node);
+            }
+            public override void Visit(UpdateStatement node)
+            {
+                string t = GetTableName(node.UpdateSpecification?.Target);
+                if (!IsBusinessTable(t)) { base.Visit(node); return; }
+                string entity = Humanize(t);
+                if (node.UpdateSpecification?.SetClauses != null)
+                    foreach (var c in node.UpdateSpecification.SetClauses)
+                        if (c is AssignmentSetClause a) { var d = DescribeBusinessChange(entity, a); if (!string.IsNullOrEmpty(d)) _ops.Add(d); }
+                base.Visit(node);
+            }
+            public override void Visit(DeleteStatement node)
+            {
+                string t = GetTableName(node.DeleteSpecification?.Target);
+                if (IsBusinessTable(t)) _ops.Add($"removes {Humanize(t)} record");
+                base.Visit(node);
+            }
+            private string DescribeBusinessChange(string entity, AssignmentSetClause a)
+            {
+                string col = GetColumnName(a.Column), ch = HumanizeColumn(col);
+                return a.NewValue switch
+                {
+                    StringLiteral s when IsStatusColumn(col) => DescribeStatusChange(entity, ch, s.Value),
+                    IntegerLiteral i when IsActiveColumn(col) => i.Value == "1" ? $"activates {entity}" : $"deactivates {entity}",
+                    BinaryExpression b when IsIncrement(b) => $"increases {entity} {ch}",
+                    BinaryExpression b when IsDecrement(b) => $"decreases {entity} {ch}",
+                    FunctionCall f when IsGetDate(f) && IsModifiedColumn(col) => $"stamps {entity} with current time",
+                    FunctionCall f when IsDateAdd(f) => $"extends {entity} {ch}",
+                    VariableReference => $"sets {entity} {ch} from input",
+                    _ => null
+                };
+            }
+            public string BuildSummary() => _ops.Any() ? string.Join("; ", _ops) : "modifies data";
+
+            static bool IsStatusColumn(string c) => c?.EndsWith("Status", StringComparison.OrdinalIgnoreCase) == true;
+            static bool IsActiveColumn(string c) => c?.Equals("IsActive", StringComparison.OrdinalIgnoreCase) == true || c?.Equals("IsDeleted", StringComparison.OrdinalIgnoreCase) == true;
+            static bool IsModifiedColumn(string c) => c?.EndsWith("Date", StringComparison.OrdinalIgnoreCase) == true;
+            static bool IsIncrement(BinaryExpression b) => b.BinaryExpressionType == BinaryExpressionType.Add;
+            static bool IsDecrement(BinaryExpression b) => b.BinaryExpressionType == BinaryExpressionType.Subtract;
+            static bool IsGetDate(FunctionCall f) => f.FunctionName?.Value?.Equals("GETDATE", StringComparison.OrdinalIgnoreCase) == true;
+            static bool IsDateAdd(FunctionCall f) => f.FunctionName?.Value?.Equals("DATEADD", StringComparison.OrdinalIgnoreCase) == true;
+
+            static string DescribeStatusChange(string entity, string col, string v)
+            {
+                string l = v.ToLower();
+                if (l == "approved") return $"approves {entity}";
+                if (l == "rejected") return $"rejects {entity}";
+                if (l == "cancelled" || l == "canceled") return $"cancels {entity}";
+                if (l == "completed" || l == "done") return $"completes {entity}";
+                if (l == "pending") return $"marks {entity} as pending";
+                if (l == "active") return $"activates {entity}";
+                if (l == "inactive") return $"deactivates {entity}";
+                if (l == "returned") return $"marks {entity} as returned";
+                if (l == "lost") return $"marks {entity} as lost";
+                if (l == "paid") return $"marks {entity} as paid";
+                if (l == "unpaid") return $"marks {entity} as unpaid";
+                if (l == "waived") return $"waives {entity}";
+                if (l == "enrolled") return $"enrolls in {entity}";
+                if (l.EndsWith("ed")) return $"marks {entity} as {l}";
+                return $"sets {entity} {col} to {l}";
+            }
+        }
+
+        class AuditDetailExtractor : TSqlFragmentVisitor
+        {
+            private string _action, _table;
+            public override void Visit(InsertStatement node)
+            {
+                var cols = node.InsertSpecification?.Columns;
+                var row = (node.InsertSpecification?.InsertSource as ValuesInsertSource)?.RowValues?.FirstOrDefault()?.ColumnValues;
+                if (cols == null || row == null) return;
+                for (int i = 0; i < cols.Count && i < row.Count; i++)
+                {
+                    string cn = cols[i].MultiPartIdentifier?.Identifiers?.LastOrDefault()?.Value ?? "";
+                    if (cn.Equals("ActionType", StringComparison.OrdinalIgnoreCase) && row[i] is StringLiteral l) _action = l.Value;
+                    if (cn.Equals("TableName", StringComparison.OrdinalIgnoreCase) && row[i] is StringLiteral t) _table = t.Value;
+                }
+                base.Visit(node);
+            }
+            public string BuildSummary()
+            {
+                if (_action != null && _table != null) return $"records {_action.ToLower()} of {Humanize(_table)} to audit trail";
+                if (_action != null) return $"logs {_action.ToLower()} operation";
+                return "records audit entry";
+            }
+        }
+
+        class ParameterNameExtractor : TSqlFragmentVisitor
+        {
+            public List<string> Parameters { get; } = new();
+            public override void Visit(VariableReference node) { if (!string.IsNullOrEmpty(node.Name)) Parameters.Add(node.Name); base.Visit(node); }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // SHARED AST HELPERS
+        // ═══════════════════════════════════════════════════════════
+
+        static string GetTableName(TableReference t) => (t as NamedTableReference)?.SchemaObject?.BaseIdentifier?.Value ?? "";
+        static string GetColumnName(ColumnReferenceExpression c) => c?.MultiPartIdentifier?.Identifiers?.LastOrDefault()?.Value ?? "";
+        static string GetColumnName(ScalarExpression e) => (e as ColumnReferenceExpression)?.MultiPartIdentifier?.Identifiers?.LastOrDefault()?.Value ?? "";
+        static string GetExpressionText(ScalarExpression e) => e switch { StringLiteral s => $"'{s.Value}'", IntegerLiteral i => i.Value, VariableReference v => v.Name, _ => "value" };
+        static bool IsBusinessTable(string t) => !string.IsNullOrEmpty(t) && !t.StartsWith("#") && !t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase) && t.Length > 3;
+
+        static string Humanize(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return id;
+            var w = new List<string>(); int s = 0;
+            for (int i = 1; i < id.Length; i++) if (char.IsUpper(id[i]) && !char.IsUpper(id[i - 1])) { w.Add(id.Substring(s, i - s)); s = i; }
+            if (s < id.Length) w.Add(id.Substring(s));
+            return string.Join(" ", w).ToLower();
+        }
+
+        static string HumanizeColumn(string c)
+        {
+            if (string.IsNullOrEmpty(c)) return c;
+            var w = new List<string>(); int s = 0;
+            for (int i = 1; i < c.Length; i++) if (char.IsUpper(c[i]) && !char.IsUpper(c[i - 1])) { w.Add(c.Substring(s, i - s)); s = i; }
+            if (s < c.Length) w.Add(c.Substring(s));
+            return string.Join(" ", w.Select(x => x.Equals("ID", StringComparison.OrdinalIgnoreCase) ? "ID" : x.ToLower()));
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // HELPERS
+        // ═══════════════════════════════════════════════════════════
+
+        private bool IsRealTable(string t) => !string.IsNullOrEmpty(t) && !t.StartsWith("#") && !t.EndsWith("_cursor") && !t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase) && t.Length > 3;
+
+        private string BuildEmbeddingText(StructuralSignals proc, BusinessDomain domain, SemanticIntent intent, string stage, List<SemanticSection> sections)
         {
             var sb = new System.Text.StringBuilder();
             sb.AppendLine(proc.SemanticSummary);
@@ -1066,55 +1392,36 @@ namespace SqlChunkerApp
             sb.AppendLine($"and represents the {stage.ToLower()} stage of the {domain.BusinessFlow.ToLower()} lifecycle.");
             sb.AppendLine();
             sb.AppendLine($"It operates primarily on {intent.PrimaryEntity}");
-            if (intent.RelatedEntities.Any())
-                sb.AppendLine($"and involves {string.Join(", ", intent.RelatedEntities)}.");
+            if (intent.RelatedEntities.Any()) sb.AppendLine($"and involves {string.Join(", ", intent.RelatedEntities)}.");
             sb.AppendLine();
             sb.AppendLine("Semantic sections available:");
-            foreach (var section in sections)
-                sb.AppendLine($"- {section.SectionType}: {section.Purpose}");
-            sb.AppendLine();
-            if (intent.BusinessRules.Any())
-            {
-                sb.AppendLine("Business rules enforced:");
-                foreach (var rule in intent.BusinessRules)
-                    sb.AppendLine($"- {rule}");
-            }
+            foreach (var st in sections.Select(x => x.SectionType).Distinct()) sb.AppendLine($"- {st}: {GetSectionPurpose(st)}");
+            if (intent.BusinessRules.Any()) { sb.AppendLine("Business rules enforced:"); foreach (var r in intent.BusinessRules) sb.AppendLine($"- {r}"); }
             return sb.ToString().Trim();
         }
 
         private string GetLifecycleStage(StructuralSignals proc)
         {
-            string name = proc.ObjectName.Replace("sp_", "");
-            int split = 1;
-            while (split < name.Length && !char.IsUpper(name[split])) split++;
-            string stage = split > 1 ? name.Substring(0, split) : name;
-            if (string.IsNullOrEmpty(stage) || stage.Length <= 1)
-                return proc.ChunkClassification switch
-                {
-                    "ARCHIVE" => "Archive", "PURGE" => "Purge", "AUDIT" => "Audit",
-                    "REPORT"  => "Generate", _ => "Process"
-                };
+            string n = proc.ObjectName.Replace("sp_", ""); int sp = 1;
+            while (sp < n.Length && !char.IsUpper(n[sp])) sp++;
+            string stage = sp > 1 ? n.Substring(0, sp) : n;
+            if (string.IsNullOrEmpty(stage) || stage.Length <= 1) return proc.ChunkClassification switch { "ARCHIVE" => "Archive", "PURGE" => "Purge", "AUDIT" => "Audit", "REPORT" => "Generate", _ => "Process" };
             return stage;
         }
 
         private List<string> FindDependencies(StructuralSignals proc, List<StructuralSignals> allSignals)
         {
-            var deps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var rt in proc.ReadsFrom.Where(t => !IsInfrastructure(t)))
-                foreach (var w in allSignals
-                    .Where(o => o != proc && o.WritesTo.Contains(rt) && !o.IsReadOnly)
-                    .Select(o => o.ObjectName))
-                    deps.Add($"{w} (writes {rt})");
-            return deps.Take(10).ToList();
+            var d = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rt in proc.ReadsFrom.Where(IsRealTable))
+                foreach (var w in allSignals.Where(o => o != proc && o.WritesTo.Contains(rt) && !o.IsReadOnly).Select(o => o.ObjectName))
+                    d.Add($"{w} (writes {rt})");
+            return d.Take(10).ToList();
         }
 
-        private bool IsInfrastructure(string t) =>
-            string.IsNullOrEmpty(t)
-            || t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase)
-            || t.StartsWith("#")
-            || t.EndsWith("_Archive")
-            || t.Length <= 3;
+        private bool IsInfrastructure(string t) => string.IsNullOrEmpty(t) || t.Equals("AuditLog", StringComparison.OrdinalIgnoreCase) || t.StartsWith("#") || t.EndsWith("_Archive") || t.Length <= 3;
     }
+
+
 
     /// <summary>
     /// Definition of a semantic section in the hierarchy.
@@ -1260,9 +1567,6 @@ namespace SqlChunkerApp
 
     class StructuralSignalParser
     {
-        private readonly TSql160Parser _parser;
-        private readonly Sql160ScriptGenerator _generator;
-
         private static readonly HashSet<string> Keywords = new(StringComparer.OrdinalIgnoreCase)
         {
             "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL",
@@ -1287,6 +1591,8 @@ namespace SqlChunkerApp
             "SCOPE", "OBJECT", "SYS", "SYSTEM", "STRING_SPLIT", "VALUE",
             "FAST_FORWARD", "LOCAL", "STATIC", "FORWARD_ONLY", "READ_ONLY"
         };
+        private readonly TSql160Parser _parser;
+        private readonly Sql160ScriptGenerator _generator;
 
         public StructuralSignalParser()
         {
@@ -1745,6 +2051,8 @@ namespace SqlChunkerApp
                 }
             }
 
+            
+
             foreach (var (name, cap) in capabilities)
             {
                 if (cap.Procedures.Count >= 2) continue;
@@ -1792,6 +2100,7 @@ namespace SqlChunkerApp
                 }
 
                 merged[name] = cap;
+
             }
 
             return merged;
