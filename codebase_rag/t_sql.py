@@ -1,5 +1,6 @@
 import json
-from typing import List, Dict, Optional
+import numpy as np
+from typing import List, Dict, Optional,Tuple
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -55,9 +56,13 @@ class SqlChunkIndexer:
     def build_embedding_text(self, chunk: Dict) -> str:
         """Only embed semantic description — never SQL."""
         parts = [chunk.get("embeddingText", "")]
+        
+        # Now each section has its own unique summary
         for s in chunk.get("sections", []):
-            if s.get("summary"):
-                parts.append(f"[{s['type']}] {s['summary']}")
+            section_summary = s.get("summary", "")
+            if section_summary:
+                parts.append(f"[{s.get('sectionType', s.get('type', ''))}] {section_summary}")
+        
         return "\n".join(parts).strip()
 
     def build_payload(self, chunk: Dict) -> Dict:
@@ -80,6 +85,7 @@ class SqlChunkIndexer:
             "sections": {
                 s.get("sectionType", s.get("type", "")): {
                     "purpose": s.get("purpose", ""),
+                    "summary": s.get("summary", ""),
                     "sqlText": s.get("sqlText", ""),
                     "startLine": s.get("startLine"),
                     "endLine": s.get("endLine"),
@@ -158,6 +164,7 @@ class SqlChunkIndexer:
         return formatted
 
 
+
 # ═══════════════════════════════════════════════════════════════
 # SECTION SELECTOR
 # ═══════════════════════════════════════════════════════════════
@@ -171,7 +178,7 @@ class SectionSelector:
     # Which sections are needed for different query intents
     INTENT_SECTIONS = {
         "what_is":       ["HEADER", "VALIDATION", "OUTPUT"],
-        "how_to":        ["HEADER", "VALIDATION", "DATA_MODIFICATION", "AUDIT", "TRANSACTION", "OUTPUT"],
+        "how_to":        ["HEADER", "VALIDATION", "DATA_MODIFICATION", "AUDIT", "OUTPUT"],
         "validate":      ["VALIDATION", "BUSINESS_RULES"],
         "modify":        ["DATA_MODIFICATION", "TRANSACTION", "AUDIT"],
         "error":         ["ERROR_HANDLING", "VALIDATION"],
@@ -181,42 +188,38 @@ class SectionSelector:
     }
     
     def select(self, chunk: Dict, intent: str = "how_to", max_sections: int = 4) -> Dict:
-        """
-        Select relevant sections based on query intent.
-        
-        Returns a filtered chunk with only the needed sections.
-        """
         sections = chunk.get("sections", {})
         allowed = self.INTENT_SECTIONS.get(intent)
         
-        if allowed is None:  # "full" intent
-            selected = sections
+        if allowed is None:
+            selected = dict(sections)  # copy all
         else:
             selected = {
                 k: v for k, v in sections.items()
                 if k in allowed
             }
         
-        # Limit to most important sections
+        # Priority order for sorting
         priority_order = ["HEADER", "VALIDATION", "BUSINESS_RULES", 
-                         "DATA_MODIFICATION", "TRANSACTION", "AUDIT", 
-                         "OUTPUT", "DATA_RETRIEVAL", "ERROR_HANDLING",
-                         "INITIALIZATION", "CLEANUP"]
+                        "DATA_MODIFICATION", "TRANSACTION", "AUDIT", 
+                        "OUTPUT", "DATA_RETRIEVAL", "ERROR_HANDLING",
+                        "INITIALIZATION", "CLEANUP"]
         
         ordered = sorted(
             selected.items(),
             key=lambda x: priority_order.index(x[0]) if x[0] in priority_order else 999
         )
         
-        selected = dict(ordered[:max_sections])
+        # Take only top max_sections AND create a NEW filtered dict
+        filtered_sections = dict(ordered[:max_sections])
         
         return {
             "id": chunk["id"],
             "score": chunk.get("score"),
             "summary": chunk.get("summary", ""),
             "metadata": chunk.get("metadata", {}),
-            "selected_sections": list(selected.keys()),
-            "sections": selected,
+            "selected_sections": list(filtered_sections.keys()),
+            "sections": filtered_sections,  # ← ONLY the selected sections, not all
         }
 
 
@@ -233,15 +236,7 @@ class SectionValidator:
     def __init__(self, max_tokens_per_section: int = 2000):
         self.max_tokens = max_tokens_per_section
     
-    def validate(self, filtered_chunk: Dict) -> Dict:
-        """
-        Validate and clean selected sections.
-        
-        - Removes empty sections
-        - Truncates overly long sections
-        - Ensures HEADER is present for business operations
-        - Adds context about missing sections
-        """
+    def validate(self, filtered_chunk: Dict, intent: str = "how_to") -> Dict:
         sections = filtered_chunk.get("sections", {})
         metadata = filtered_chunk.get("metadata", {})
         
@@ -254,12 +249,15 @@ class SectionValidator:
         # Truncate long sections
         for key in sections:
             sql = sections[key]["sqlText"]
-            if len(sql) > self.max_tokens * 4:  # rough char estimate
+            if len(sql) > self.max_tokens * 4:
                 sections[key]["sqlText"] = sql[:self.max_tokens * 4] + "\n-- [TRUNCATED]"
                 sections[key]["truncated"] = True
+
+        # Only warn about missing HEADER for intents that need it
+        needs_header = intent in ("how_to", "what_is", "modify", "full")
+        has_header = any(k.upper() == "HEADER" for k in sections.keys())
         
-        # Ensure HEADER exists for business operations
-        if metadata.get("classification") == "BUSINESS_OPERATION" and "HEADER" not in sections:
+        if metadata.get("classification") == "BUSINESS_OPERATION" and needs_header and not has_header:
             sections["_missing_header"] = {
                 "purpose": "Header was not selected",
                 "sqlText": f"-- Procedure: {filtered_chunk['id']}",
@@ -304,61 +302,198 @@ class SectionValidator:
         
         return "\n".join(parts)
 
+class SectionScorer:
+    def __init__(self, model: SentenceTransformer):
+        self.model = model
+    
+    def score_sections(self, query: str, sections: Dict) -> Dict[str, float]:
+        """Score each section by comparing query to the section's unique summary."""
+        if not sections:
+            return {}
+        
+        section_names = list(sections.keys())
+        section_summaries = []
+        for name in section_names:
+            section = sections[name]
+            # Prefer the business summary, fall back to purpose, then section name
+            summary = section.get("summary", "") or section.get("purpose", "") or name
+            section_summaries.append(summary)
+        
+        query_vector = self.model.encode(query, normalize_embeddings=True)
+        summary_vectors = self.model.encode(section_summaries, normalize_embeddings=True)
+        
+        scores = {}
+        for i, name in enumerate(section_names):
+            similarity = float(np.dot(query_vector, summary_vectors[i]))
+            scores[name] = round(similarity, 4)
+
+        
+        return scores
+    
+    def select_sections(
+        self,
+        chunk: Dict,
+        query: str,
+        max_sections: int = 5,
+        min_score: float = 0.2
+    ) -> Dict:
+        """
+        Select the most relevant sections from a chunk based on query similarity.
+        
+        Args:
+            chunk: The retrieved chunk with all sections
+            query: The user's original query
+            max_sections: Maximum number of sections to return
+            min_score: Minimum relevance score to include a section
+        """
+        sections = chunk.get("sections", {})
+        
+        # Score each available section type
+        scores = self.score_sections(query)
+        
+        # Filter to only sections that exist in this chunk AND meet min score
+        available_scores = {
+            name: scores.get(name, 0)
+            for name in sections.keys()
+            if scores.get(name, 0) >= min_score
+        }
+        
+        # Always include HEADER if it exists and score is borderline
+        if "HEADER" in sections and "HEADER" not in available_scores:
+            header_score = scores.get("HEADER", 0)
+            if header_score >= 0.1:  # lower threshold for HEADER
+                available_scores["HEADER"] = header_score
+        
+        # Sort by score descending
+        ranked = sorted(available_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Take top N
+        selected = dict(ranked[:max_sections])
+        
+        # Build filtered sections
+        filtered_sections = {
+            name: sections[name]
+            for name in selected.keys()
+        }
+        
+        return {
+            "id": chunk["id"],
+            "score": chunk.get("score"),
+            "summary": chunk.get("summary", ""),
+            "metadata": chunk.get("metadata", {}),
+            "selected_sections": list(filtered_sections.keys()),
+            "section_scores": selected,
+            "sections": filtered_sections,
+        }
+
+
+class SmartSectionSelector:
+
+    IMPORTANCE_WEIGHTS = {
+        "HEADER": 0.75,
+        "VALIDATION": 1.2,
+        "BUSINESS_RULES": 1.1,
+        "DATA_MODIFICATION": 1.0,
+        "OUTPUT": 1.0,
+        "DATA_RETRIEVAL": 1.0,
+        "AUDIT": 0.65,
+        "TRANSACTION": 0.7,
+        "ERROR_HANDLING": 0.6,
+        "INITIALIZATION": 0.5,
+        "CLEANUP": 0.4,
+    }
+
+    def __init__(self, model: SentenceTransformer):
+        self.model = model
+        self.scorer = SectionScorer(model)
+    
+    def select(self, chunk: Dict, query: str, max_sections: int = 5, min_score: float = 0.15) -> Dict:
+        sections = chunk.get("sections", {})
+        
+        # Score the actual sections in this chunk using their unique summaries
+        base_scores = self.scorer.score_sections(query, sections)  # ← pass sections
+        
+        # Apply importance weighting
+        weighted_scores = {}
+        for name, score in base_scores.items():
+            weight = self.IMPORTANCE_WEIGHTS.get(name, 1.0)
+            weighted_scores[name] = round(score * weight, 4)
+        
+        # Filter to available sections above min score
+        available = {
+            name: weighted_scores.get(name, 0)
+            for name in sections.keys()
+            if weighted_scores.get(name, 0) >= min_score
+        }
+        
+        # Always include HEADER if it exists
+        if "HEADER" in sections and "HEADER" not in available:
+            available["HEADER"] = max(weighted_scores.get("HEADER", 0), 0.1)
+        
+        # Rank and select
+        ranked = sorted(available.items(), key=lambda x: x[1], reverse=True)
+        selected = dict(ranked[:max_sections])
+        
+        filtered_sections = {name: sections[name] for name in selected.keys()}
+        
+        return {
+            "id": chunk["id"],
+            "score": chunk.get("score"),
+            "summary": chunk.get("summary", ""),
+            "metadata": chunk.get("metadata", {}),
+            "selected_sections": list(filtered_sections.keys()),
+            "section_scores": selected,
+            "all_scores": weighted_scores,
+            "sections": filtered_sections,
+        }
+
 
 # ═══════════════════════════════════════════════════════════════
-# USAGE
+# UPDATED USAGE
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     indexer = SqlChunkIndexer(collection_name="hrms_procedures")
     indexer.create_collection()
-    indexer.index_chunks("semantic_chunks.json")
+    indexer.index_chunks(r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\t-sql\shared_data\semantic_chunks.json")
     
-    selector = SectionSelector()
+    # Initialize smart selector with the same model
+    selector = SmartSectionSelector(model=indexer.model)
     validator = SectionValidator(max_tokens_per_section=1500)
     
     # ── Example 1: "How do I add a new employee?" ─────────────
-    results = indexer.search(
-        query="How do I hire a new employee with validation?",
-        top_k=3,
-        classification="BUSINESS_OPERATION"
-    )
+    query1 = "How do I hire a new employee with validation?"
+    results = indexer.search(query=query1, top_k=3, classification="BUSINESS_OPERATION")
     
     for r in results:
-        # Select only the sections needed to understand "how to" do this
-        filtered = selector.select(r, intent="how_to", max_sections=5)
-        
-        # Validate and clean
-        validated = validator.validate(filtered)
-        
-        # Get LLM-ready context
-        context = validator.to_llm_context(validated)
         print(f"\n{'='*60}")
-        print(context[:1500])
+        print(f"Procedure: {r['id']} (score: {r['score']:.3f})")
+        
+        # Smart selection based on query
+        filtered = selector.select(r, query=query1, max_sections=5)
+        
+        print(f"Section scores: {filtered['section_scores']}")
+        print(f"Selected: {filtered['selected_sections']}")
+        
+        validated = validator.validate(filtered, intent="auto")
+        context = validator.to_llm_context(validated)
+        print(context[:800])
     
     # ── Example 2: "What validations exist?" ──────────────────
-    results = indexer.search(
-        query="What business rules validate employee data?",
-        top_k=3,
-        traits=["VALIDATED"]
-    )
+    query2 = "What business rules validate employee data before insertion?"
+    results = indexer.search(query=query2, top_k=3, traits=["VALIDATED"])
     
     for r in results:
-        filtered = selector.select(r, intent="validate", max_sections=3)
-        validated = validator.validate(filtered)
-        # Only validation sections are returned
-        print(f"\n{r['id']}: {list(validated['sections'].keys())}")
+        filtered = selector.select(r, query=query2, max_sections=3)
+        print(f"\n{r['id']}: scores={filtered['section_scores']}")
+        print(f"  Selected: {filtered['selected_sections']}")
     
-    # ── Example 3: "Show me all reports" ──────────────────────
-    results = indexer.search(
-        query="dashboards and attendance reports",
-        top_k=5,
-        classification="REPORT"
-    )
+    # ── Example 3: "How is payroll calculated?" ───────────────
+    query3 = "How is payroll calculated and processed in batches?"
+    results = indexer.search(query=query3, top_k=3)
     
     for r in results:
-        filtered = selector.select(r, intent="report", max_sections=3)
-        validated = validator.validate(filtered)
-        context = validator.to_llm_context(validated)
+        filtered = selector.select(r, query=query3, max_sections=5)
         print(f"\n{r['id']} (score: {r['score']:.3f})")
-        print(f"  Sections: {validated['selected_sections']}")
+        print(f"  All scores: {filtered['all_scores']}")
+        print(f"  Selected: {filtered['selected_sections']}")
