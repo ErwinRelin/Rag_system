@@ -882,20 +882,20 @@ namespace SqlChunkerApp
             if ((lineUpper.StartsWith("IF ") || lineUpper.StartsWith("IF(")) && IsInputValidation(lineUpper))
                 return "VALIDATION";
 
-            if ((lineUpper.StartsWith("INSERT ") || lineUpper.StartsWith("UPDATE ") ||
-                lineUpper.StartsWith("DELETE ") || lineUpper.StartsWith("MERGE ")) && !lineUpper.Contains("AUDITLOG"))
-                return "DATA_MODIFICATION";
-
             if (lineUpper.StartsWith("INSERT INTO #") || lineUpper.StartsWith("INSERT  INTO #"))
                 return "INITIALIZATION";
-            if (lineUpper.StartsWith("UPDATE #")) return "BUSINESS_RULES";
 
-            if (lineUpper.StartsWith("IF ") || lineUpper.StartsWith("IF(") || lineUpper.StartsWith("ELSE ") ||
-                lineUpper == "ELSE" || lineUpper.StartsWith("ELSE IF ") || lineUpper.StartsWith("WHILE "))
-                return "BUSINESS_RULES";
+            // ── BUSINESS_PROCESS: DML + calculations + decisions ─────────
+            bool isDml = lineUpper.StartsWith("INSERT ") || lineUpper.StartsWith("UPDATE ") || 
+                        lineUpper.StartsWith("DELETE ") || lineUpper.StartsWith("MERGE ");
+            bool isCalculation = (lineUpper.StartsWith("SET @") || lineUpper.StartsWith("SELECT @")) && !beforeFirstDml;
+            bool isDecision = lineUpper.StartsWith("IF ") || lineUpper.StartsWith("ELSE ") || 
+                            lineUpper == "ELSE" || lineUpper.StartsWith("WHILE ");
 
-            if ((lineUpper.StartsWith("SET @") || lineUpper.StartsWith("SELECT @")) && !beforeFirstDml)
-                return "BUSINESS_RULES";
+            if (isDml && !lineUpper.Contains("AUDITLOG") && !lineUpper.Contains("#"))
+                return "BUSINESS_PROCESS";
+            if (isCalculation || isDecision)
+                return "BUSINESS_PROCESS";
 
             if (lineUpper.StartsWith("SELECT ") && !lineUpper.Contains("SELECT @") &&
                 !lineUpper.Contains("SELECT 1") && !lineUpper.Contains("SELECT COUNT"))
@@ -943,9 +943,8 @@ namespace SqlChunkerApp
             "HEADER" => "Procedure signature and variable declarations",
             "INITIALIZATION" => "Variable initialization and default values",
             "VALIDATION" => "Input validation and business rule checks",
-            "BUSINESS_RULES" => "Decision logic and calculations",
+            "BUSINESS_PROCESS" => "Core business logic: calculations, data modifications, workflow progression",
             "DATA_RETRIEVAL" => "Reading existing data from tables",
-            "DATA_MODIFICATION" => "Modifying persistent data",
             "TRANSACTION" => "Transaction control statements",
             "AUDIT" => "Audit logging operations",
             "OUTPUT" => "Returning results to caller",
@@ -974,7 +973,7 @@ namespace SqlChunkerApp
                 var cur = sections[i];
                 var last = result[result.Count - 1];
                 bool lastIsSingle = last.SqlText.Split('\n').Length == 1;
-                bool lastIsStructural = last.SectionType == "DATA_MODIFICATION" || last.SectionType == "AUDIT" ||
+                bool lastIsStructural = last.SectionType == "BUSINESS_PROCESS" || last.SectionType == "AUDIT" ||
                                         last.SectionType == "OUTPUT" || last.SectionType == "ERROR_HANDLING";
                 if (lastIsSingle && !lastIsStructural)
                 {
@@ -991,7 +990,7 @@ namespace SqlChunkerApp
         private List<SemanticSection> MergeAdjacentSameType(List<SemanticSection> sections)
         {
             var merged = new List<SemanticSection> { sections[0] };
-            var validationTypes = new HashSet<string> { "VALIDATION", "INITIALIZATION", "BUSINESS_RULES" };
+            var validationTypes = new HashSet<string> { "VALIDATION", "INITIALIZATION" };
             for (int i = 1; i < sections.Count; i++)
             {
                 var cur = sections[i];
@@ -1006,6 +1005,23 @@ namespace SqlChunkerApp
                     continue;
                 }
                 merged.Add(cur);
+                // Merge BUSINESS_PROCESS into VALIDATION if it contains validation-like IFs
+                // This handles the case where IF/Raiserror pairs get split across sections
+                if (last.SectionType == "VALIDATION" && cur.SectionType == "BUSINESS_PROCESS" &&
+                    cur.SqlText.Contains("RAISERROR"))
+                {
+                    MergeInto(last, cur);
+                    continue;
+                }
+
+                if (last.SectionType == "BUSINESS_PROCESS" && cur.SectionType == "VALIDATION" &&
+                    last.SqlText.Contains("IF ") && !last.SqlText.Contains("INSERT") && !last.SqlText.Contains("UPDATE"))
+                {
+                    last.SectionType = "VALIDATION";
+                    last.Purpose = "Input validation and business rule checks";
+                    MergeInto(last, cur);
+                    continue;
+                }
             }
             return merged;
         }
@@ -1060,7 +1076,7 @@ namespace SqlChunkerApp
             {
                 "HEADER"            => SummarizeHeader(sql, proc),
                 "VALIDATION"        => SummarizeValidation(sql),
-                "DATA_MODIFICATION" => SummarizeModification(sql),
+                "BUSINESS_PROCESS" => SummarizeModification(sql),
                 "AUDIT"             => SummarizeAudit(sql),
                 "TRANSACTION"       => SummarizeTransaction(sql),
                 "OUTPUT"            => SummarizeOutput(sql),
@@ -1068,7 +1084,6 @@ namespace SqlChunkerApp
                 "ERROR_HANDLING"    => SummarizeErrorHandling(sql),
                 "CLEANUP"           => SummarizeCleanup(sql),
                 "INITIALIZATION"    => SummarizeInitialization(sql),
-                "BUSINESS_RULES"    => SummarizeBusinessRules(sql),
                 _                   => section.Purpose
             };
         }
@@ -1167,14 +1182,6 @@ namespace SqlChunkerApp
             if (sql.Contains("MAX(")) a.Add("generates next sequence number");
             if (sql.Contains("COUNT(*)")) a.Add("counts records");
             return a.Any() ? string.Join("; ", a) : "initializes variables";
-        }
-
-        private string SummarizeBusinessRules(string sql)
-        {
-            if (sql.Contains("SCOPE_IDENTITY()")) return "captures generated record identity";
-            if (sql.Contains("CASE")) return "evaluates conditional logic";
-            if (sql.Contains("ELSE")) return "branches on conditions";
-            return "applies business logic";
         }
 
         // ═══════════════════════════════════════════════════════════
