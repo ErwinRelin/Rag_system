@@ -1,6 +1,7 @@
 import json
+import requests
+from typing import List, Dict, Optional
 import numpy as np
-from typing import List, Dict, Optional,Tuple
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -9,19 +10,18 @@ from qdrant_client.models import (
 )
 
 
+# ═══════════════════════════════════════════════════════════════
+# QDRANT INDEXER
+# ═══════════════════════════════════════════════════════════════
+
 class SqlChunkIndexer:
-    """
-    Embeds semantic chunks and stores them in Qdrant.
-    Retrieval returns relevant sections — not the full SQL.
-    """
-    
     def __init__(
         self,
         collection_name: str = "sql_chunks",
-        model_name: str = "all-MiniLM-L6-v2",
+        model_name: str = "nomic-ai/nomic-embed-text-v1",
         qdrant_host: str = "localhost",
         qdrant_port: int = 6333,
-        vector_size: int = 384
+        vector_size: int = 768
     ):
         self.collection_name = collection_name
         self.model = SentenceTransformer(model_name)
@@ -29,7 +29,6 @@ class SqlChunkIndexer:
         self.vector_size = vector_size
 
     def create_collection(self):
-        """Create collection with indexes for filterable metadata."""
         self.client.recreate_collection(
             collection_name=self.collection_name,
             vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE)
@@ -54,19 +53,14 @@ class SqlChunkIndexer:
             return json.load(f)
 
     def build_embedding_text(self, chunk: Dict) -> str:
-        """Only embed semantic description — never SQL."""
         parts = [chunk.get("embeddingText", "")]
-        
-        # Now each section has its own unique summary
         for s in chunk.get("sections", []):
-            section_summary = s.get("summary", "")
-            if section_summary:
-                parts.append(f"[{s.get('sectionType', s.get('type', ''))}] {section_summary}")
-        
+            summary = s.get("summary", "")
+            if summary:
+                parts.append(f"[{s.get('sectionType', '')}] {summary}")
         return "\n".join(parts).strip()
 
     def build_payload(self, chunk: Dict) -> Dict:
-        """Payload: metadata + section summaries + SQL indexed by section type."""
         return {
             "id": chunk["id"],
             "embeddingText": chunk.get("embeddingText", ""),
@@ -83,7 +77,7 @@ class SqlChunkIndexer:
                 "dependencies": chunk.get("metadata", {}).get("dependencies", []),
             },
             "sections": {
-                s.get("sectionType", s.get("type", "")): {
+                s.get("sectionType", ""): {
                     "purpose": s.get("purpose", ""),
                     "summary": s.get("summary", ""),
                     "sqlText": s.get("sqlText", ""),
@@ -113,10 +107,6 @@ class SqlChunkIndexer:
             print(f"  {min(start + batch_size, len(chunks))}/{len(chunks)}")
         print("Done.")
 
-    # ═══════════════════════════════════════════════════════════
-    # RETRIEVAL
-    # ═══════════════════════════════════════════════════════════
-
     def search(
         self,
         query: str,
@@ -127,7 +117,6 @@ class SqlChunkIndexer:
         max_reporting_score: Optional[float] = None,
         traits: Optional[List[str]] = None,
     ) -> List[Dict]:
-        """Search and return chunks with metadata + section map."""
         must = []
         if classification:
             must.append(FieldCondition(key="metadata.classification", match=MatchValue(value=classification)))
@@ -164,239 +153,42 @@ class SqlChunkIndexer:
         return formatted
 
 
-
 # ═══════════════════════════════════════════════════════════════
-# SECTION SELECTOR
+# SECTION SCORER
 # ═══════════════════════════════════════════════════════════════
-
-class SectionSelector:
-    """
-    Selects only the relevant sections from a retrieved chunk.
-    Passes them to a validator for final filtering.
-    """
-    
-    # Which sections are needed for different query intents
-    INTENT_SECTIONS = {
-        "what_is":       ["HEADER", "VALIDATION", "OUTPUT"],
-        "how_to":        ["HEADER", "VALIDATION", "DATA_MODIFICATION", "AUDIT", "OUTPUT"],
-        "validate":      ["VALIDATION", "BUSINESS_RULES"],
-        "modify":        ["DATA_MODIFICATION", "TRANSACTION", "AUDIT"],
-        "error":         ["ERROR_HANDLING", "VALIDATION"],
-        "report":        ["HEADER", "DATA_RETRIEVAL", "OUTPUT"],
-        "audit":         ["AUDIT", "DATA_MODIFICATION"],
-        "full":          None,  # None = all sections
-    }
-    
-    def select(self, chunk: Dict, intent: str = "how_to", max_sections: int = 4) -> Dict:
-        sections = chunk.get("sections", {})
-        allowed = self.INTENT_SECTIONS.get(intent)
-        
-        if allowed is None:
-            selected = dict(sections)  # copy all
-        else:
-            selected = {
-                k: v for k, v in sections.items()
-                if k in allowed
-            }
-        
-        # Priority order for sorting
-        priority_order = ["HEADER", "VALIDATION", "BUSINESS_RULES", 
-                        "DATA_MODIFICATION", "TRANSACTION", "AUDIT", 
-                        "OUTPUT", "DATA_RETRIEVAL", "ERROR_HANDLING",
-                        "INITIALIZATION", "CLEANUP"]
-        
-        ordered = sorted(
-            selected.items(),
-            key=lambda x: priority_order.index(x[0]) if x[0] in priority_order else 999
-        )
-        
-        # Take only top max_sections AND create a NEW filtered dict
-        filtered_sections = dict(ordered[:max_sections])
-        
-        return {
-            "id": chunk["id"],
-            "score": chunk.get("score"),
-            "summary": chunk.get("summary", ""),
-            "metadata": chunk.get("metadata", {}),
-            "selected_sections": list(filtered_sections.keys()),
-            "sections": filtered_sections,  # ← ONLY the selected sections, not all
-        }
-
-
-# ═══════════════════════════════════════════════════════════════
-# VALIDATOR
-# ═══════════════════════════════════════════════════════════════
-
-class SectionValidator:
-    """
-    Validates that selected sections are complete and relevant.
-    Strips noise before passing to the LLM.
-    """
-    
-    def __init__(self, max_tokens_per_section: int = 2000):
-        self.max_tokens = max_tokens_per_section
-    
-    def validate(self, filtered_chunk: Dict, intent: str = "how_to") -> Dict:
-        sections = filtered_chunk.get("sections", {})
-        metadata = filtered_chunk.get("metadata", {})
-        
-        # Remove empty sections
-        sections = {
-            k: v for k, v in sections.items()
-            if v.get("sqlText", "").strip()
-        }
-        
-        # Truncate long sections
-        for key in sections:
-            sql = sections[key]["sqlText"]
-            if len(sql) > self.max_tokens * 4:
-                sections[key]["sqlText"] = sql[:self.max_tokens * 4] + "\n-- [TRUNCATED]"
-                sections[key]["truncated"] = True
-
-        # Only warn about missing HEADER for intents that need it
-        needs_header = intent in ("how_to", "what_is", "modify", "full")
-        has_header = any(k.upper() == "HEADER" for k in sections.keys())
-        
-        if metadata.get("classification") == "BUSINESS_OPERATION" and needs_header and not has_header:
-            sections["_missing_header"] = {
-                "purpose": "Header was not selected",
-                "sqlText": f"-- Procedure: {filtered_chunk['id']}",
-            }
-        
-        # Flag what was excluded
-        all_section_types = {"HEADER", "VALIDATION", "BUSINESS_RULES", "DATA_MODIFICATION",
-                            "TRANSACTION", "AUDIT", "OUTPUT", "DATA_RETRIEVAL",
-                            "ERROR_HANDLING", "INITIALIZATION", "CLEANUP"}
-        missing = all_section_types - set(sections.keys()) - {"_missing_header"}
-        
-        return {
-            **filtered_chunk,
-            "sections": sections,
-            "warnings": {
-                "truncated": [k for k, v in sections.items() if v.get("truncated")],
-                "excluded_sections": list(missing),
-            }
-        }
-    
-    def to_llm_context(self, validated: Dict) -> str:
-        """
-        Convert validated sections into a context block for the LLM.
-        """
-        parts = []
-        
-        parts.append(f"PROCEDURE: {validated['id']}")
-        parts.append(f"SUMMARY: {validated.get('summary', '')}")
-        parts.append(f"SELECTED SECTIONS: {', '.join(validated.get('selected_sections', []))}")
-        
-        warnings = validated.get("warnings", {})
-        if warnings.get("excluded_sections"):
-            parts.append(f"NOTE: Sections not included: {', '.join(warnings['excluded_sections'])}")
-        
-        parts.append("\n--- SQL SECTIONS ---\n")
-        
-        for section_type, section_data in validated.get("sections", {}).items():
-            parts.append(f"\n-- [{section_type}] {section_data.get('purpose', '')}")
-            parts.append(section_data["sqlText"])
-            if section_data.get("truncated"):
-                parts.append("-- [This section was truncated due to length]")
-        
-        return "\n".join(parts)
 
 class SectionScorer:
     def __init__(self, model: SentenceTransformer):
         self.model = model
-    
+
     def score_sections(self, query: str, sections: Dict) -> Dict[str, float]:
-        """Score each section by comparing query to the section's unique summary."""
         if not sections:
             return {}
-        
         section_names = list(sections.keys())
-        section_summaries = []
-        for name in section_names:
-            section = sections[name]
-            # Prefer the business summary, fall back to purpose, then section name
-            summary = section.get("summary", "") or section.get("purpose", "") or name
-            section_summaries.append(summary)
-        
-        query_vector = self.model.encode(query, normalize_embeddings=True)
-        summary_vectors = self.model.encode(section_summaries, normalize_embeddings=True)
-        
-        scores = {}
-        for i, name in enumerate(section_names):
-            similarity = float(np.dot(query_vector, summary_vectors[i]))
-            scores[name] = round(similarity, 4)
-
-        
-        return scores
-    
-    def select_sections(
-        self,
-        chunk: Dict,
-        query: str,
-        max_sections: int = 5,
-        min_score: float = 0.2
-    ) -> Dict:
-        """
-        Select the most relevant sections from a chunk based on query similarity.
-        
-        Args:
-            chunk: The retrieved chunk with all sections
-            query: The user's original query
-            max_sections: Maximum number of sections to return
-            min_score: Minimum relevance score to include a section
-        """
-        sections = chunk.get("sections", {})
-        
-        # Score each available section type
-        scores = self.score_sections(query)
-        
-        # Filter to only sections that exist in this chunk AND meet min score
-        available_scores = {
-            name: scores.get(name, 0)
-            for name in sections.keys()
-            if scores.get(name, 0) >= min_score
-        }
-        
-        # Always include HEADER if it exists and score is borderline
-        if "HEADER" in sections and "HEADER" not in available_scores:
-            header_score = scores.get("HEADER", 0)
-            if header_score >= 0.1:  # lower threshold for HEADER
-                available_scores["HEADER"] = header_score
-        
-        # Sort by score descending
-        ranked = sorted(available_scores.items(), key=lambda x: x[1], reverse=True)
-        
-        # Take top N
-        selected = dict(ranked[:max_sections])
-        
-        # Build filtered sections
-        filtered_sections = {
-            name: sections[name]
-            for name in selected.keys()
-        }
-        
+        summaries = [
+            sections[name].get("summary", "") or sections[name].get("purpose", "") or name
+            for name in section_names
+        ]
+        query_vec = self.model.encode(query, normalize_embeddings=True)
+        summary_vecs = self.model.encode(summaries, normalize_embeddings=True)
         return {
-            "id": chunk["id"],
-            "score": chunk.get("score"),
-            "summary": chunk.get("summary", ""),
-            "metadata": chunk.get("metadata", {}),
-            "selected_sections": list(filtered_sections.keys()),
-            "section_scores": selected,
-            "sections": filtered_sections,
+            name: round(float(np.dot(query_vec, summary_vecs[i])), 4)
+            for i, name in enumerate(section_names)
         }
 
+
+# ═══════════════════════════════════════════════════════════════
+# SMART SECTION SELECTOR
+# ═══════════════════════════════════════════════════════════════
 
 class SmartSectionSelector:
-
     IMPORTANCE_WEIGHTS = {
-        "HEADER": 0.75,
+        "HEADER": 1.3,
         "VALIDATION": 1.2,
-        "BUSINESS_RULES": 1.1,
-        "DATA_MODIFICATION": 1.0,
+        "BUSINESS_PROCESS": 1.1,
         "OUTPUT": 1.0,
         "DATA_RETRIEVAL": 1.0,
-        "AUDIT": 0.65,
+        "AUDIT": 0.8,
         "TRANSACTION": 0.7,
         "ERROR_HANDLING": 0.6,
         "INITIALIZATION": 0.5,
@@ -404,96 +196,413 @@ class SmartSectionSelector:
     }
 
     def __init__(self, model: SentenceTransformer):
-        self.model = model
         self.scorer = SectionScorer(model)
-    
+
     def select(self, chunk: Dict, query: str, max_sections: int = 5, min_score: float = 0.15) -> Dict:
         sections = chunk.get("sections", {})
-        
-        # Score the actual sections in this chunk using their unique summaries
-        base_scores = self.scorer.score_sections(query, sections)  # ← pass sections
-        
-        # Apply importance weighting
-        weighted_scores = {}
-        for name, score in base_scores.items():
-            weight = self.IMPORTANCE_WEIGHTS.get(name, 1.0)
-            weighted_scores[name] = round(score * weight, 4)
-        
-        # Filter to available sections above min score
-        available = {
-            name: weighted_scores.get(name, 0)
-            for name in sections.keys()
-            if weighted_scores.get(name, 0) >= min_score
+        base_scores = self.scorer.score_sections(query, sections)
+
+        weighted = {
+            name: round(score * self.IMPORTANCE_WEIGHTS.get(name, 1.0), 4)
+            for name, score in base_scores.items()
         }
-        
-        # Always include HEADER if it exists
+
+        available = {
+            name: weighted[name]
+            for name in sections.keys()
+            if weighted.get(name, 0) >= min_score
+        }
+
         if "HEADER" in sections and "HEADER" not in available:
-            available["HEADER"] = max(weighted_scores.get("HEADER", 0), 0.1)
-        
-        # Rank and select
+            available["HEADER"] = max(weighted.get("HEADER", 0), 0.1)
+
         ranked = sorted(available.items(), key=lambda x: x[1], reverse=True)
         selected = dict(ranked[:max_sections])
-        
-        filtered_sections = {name: sections[name] for name in selected.keys()}
-        
+
         return {
             "id": chunk["id"],
             "score": chunk.get("score"),
             "summary": chunk.get("summary", ""),
             "metadata": chunk.get("metadata", {}),
-            "selected_sections": list(filtered_sections.keys()),
+            "selected_sections": list(selected.keys()),
             "section_scores": selected,
-            "all_scores": weighted_scores,
-            "sections": filtered_sections,
+            "sections": {name: sections[name] for name in selected.keys()},
         }
 
 
 # ═══════════════════════════════════════════════════════════════
-# UPDATED USAGE
+# MAIN PIPELINE
+# ═══════════════════════════════════════════════════════════════
+
+class SqlRagPipeline:
+    def __init__(
+        self,
+        collection_name: str = "sql_chunks",
+        model_name: str = "nomic-ai/nomic-embed-text-v1",
+        model: Optional[SentenceTransformer] = None,
+        qdrant_host: str = "localhost",
+        qdrant_port: int = 6333,
+        max_context_tokens: int = 4000,
+    ):
+        self.collection_name = collection_name
+        self.model_name = model_name
+        self.qdrant_host = qdrant_host
+        self.qdrant_port = qdrant_port
+        self.max_context_tokens = max_context_tokens
+
+        # Safely initialize the model inside the block
+        if model is None:
+            self.model = SentenceTransformer(self.model_name, trust_remote_code=True)
+        else:
+            self.model = model
+
+        self.indexer = SqlChunkIndexer(
+            collection_name=collection_name,
+            model_name=model_name,
+            qdrant_host=qdrant_host,
+            qdrant_port=qdrant_port,
+        )
+        self.selector = SmartSectionSelector(model=self.indexer.model)
+        self.max_context_tokens = max_context_tokens
+
+    def index(self, chunks_path: str):
+        self.indexer.create_collection()
+        self.indexer.index_chunks(chunks_path)
+
+    def query(self, user_query: str, top_k: int = 6,
+              classification: Optional[str] = None,
+              capability: Optional[str] = None) -> Dict:
+        results = self.indexer.search(
+            query=user_query, top_k=top_k,
+            classification=classification, capability=capability,
+        )
+        return {
+            "results": results,
+            "top_procedures": [r["id"] for r in results[:top_k]],
+            "top_scores": [round(r["score"], 3) for r in results[:top_k]],
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# ANSWER GENERATOR
+# ═══════════════════════════════════════════════════════════════
+
+class AnswerGenerator:
+    INTENT_DESCRIPTIONS = """
+You are an intent classifier for a SQL codebase assistant. Classify the user's query into exactly one of these intents:
+
+1. GENERATE — User wants you to WRITE or CREATE new SQL code. They are asking for a new procedure, modification to existing code, or a new implementation. 
+   KEY INDICATORS: "write", "create", "generate", "build", "make", "code to", "implement", "change X to Y", "add feature", "modify procedure"
+   Examples: "Write me a procedure to transfer employees", "Change the payroll to batch process", "Add validation for email domains", "Create a new report"
+
+2. EXPLAIN — User wants to UNDERSTAND existing code. They are NOT asking for new code to be written.
+   KEY INDICATORS: "what does", "how does", "explain", "describe", "what is", "tell me about", "understand"
+   Examples: "What does sp_AddNewEmployee do?", "Explain the leave workflow", "How does payroll work?"
+
+3. ANALYZE — User wants to EVALUATE or COMPARE existing code. They are NOT asking for new code.
+   KEY INDICATORS: "compare", "analyze", "review", "evaluate", "pros and cons", "best practice", "difference between"
+   Examples: "Compare leave vs attendance validation", "Is this approach efficient?"
+
+4. DEBUG — User is experiencing a PROBLEM with existing code.
+   KEY INDICATORS: "error", "bug", "fix", "not working", "failing", "issue", "problem", "wrong"
+   Examples: "Why does ProcessPayroll throw an error?", "The headcount is wrong after termination"
+
+IMPORTANT: If the query asks you to WRITE, CREATE, CHANGE, MODIFY, or IMPLEMENT code, it is GENERATE — even if it also describes existing behavior.
+
+Return ONLY one word: GENERATE, EXPLAIN, ANALYZE, or DEBUG.
+"""
+
+    PROMPTS = {
+        "EXPLAIN": """You are a SQL expert explaining existing code.
+
+RULES (follow strictly):
+1. ONLY reference code shown in the RETRIEVED PROCEDURES section below.
+2. NEVER invent, suggest, or generate new SQL code, procedures, or modifications.
+3. If the retrieved code doesn't fully answer the question, say so clearly.
+4. Explain in plain language what the existing code does, step by step.
+
+RETRIEVED CONTEXT:
+{context}
+
+USER QUESTION: {query}
+
+Explain the existing code that answers this question:""",
+
+        "ANALYZE": """You are a SQL code analyst reviewing existing procedures.
+
+RULES (follow strictly):
+1. ONLY analyze code shown in the RETRIEVED PROCEDURES section below.
+2. NEVER invent, suggest, or generate new SQL code or modifications.
+3. If asked to compare, only compare procedures that are present in the context.
+4. Identify patterns, potential issues, and business rules in the existing code.
+
+RETRIEVED CONTEXT:
+{context}
+
+USER QUESTION: {query}
+
+Analyze the existing code based on this question:""",
+
+        "DEBUG": """You are a SQL debugging assistant helping fix issues in existing code.
+
+RULES (follow strictly):
+1. FIRST, examine the RETRIEVED PROCEDURES for the source of the issue.
+2. Point to specific lines or sections that may be causing the problem.
+3. If you suggest a fix, clearly mark it as SUGGESTED FIX and explain why.
+4. If the retrieved code doesn't contain the source of the error, say so.
+
+RETRIEVED CONTEXT:
+{context}
+
+USER QUESTION: {query}
+
+Debug this issue using the existing code:""",
+
+        "GENERATE": """You are a SQL developer writing stored procedures.
+
+RULES:
+1. Reference the RETRIEVED PROCEDURES for patterns, conventions, and existing tables.
+2. Follow the same patterns (error handling, transaction management, audit logging) used by existing procedures.
+3. ONLY use tables and columns that exist in the retrieved procedures.
+4. Match the naming conventions and parameter patterns of the existing codebase.
+
+RETRIEVED CONTEXT (existing procedures for reference):
+{context}
+
+USER QUESTION: {query}
+
+Generate the requested SQL code following the patterns shown above:""",
+    }
+
+    def __init__(self, pipeline: SqlRagPipeline):
+        self.pipeline = pipeline
+
+    def detect_intent(self, query: str, intent_model: str = "qwen2.5:3b") -> str:
+        # Wrap the instruction strictly and end with a direct structural cue
+        prompt = f"{self.INTENT_DESCRIPTIONS}\n\nUser query: {query}\n\nClassification: "
+        
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": intent_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    # Increased num_predict to 30 so conversational filler won't truncate the actual answer
+                    "options": {"temperature": 0.0, "num_predict": 30}, 
+                },
+                timeout=15
+            )
+            if response.status_code == 200:
+                raw = response.json().get("response", "").strip()
+                print(f"  [DEBUG] Intent LLM raw response: '{raw}'")
+                intent = raw.upper()
+                
+                # Check for keywords anywhere in the model's text response
+                for valid in ["GENERATE", "EXPLAIN", "ANALYZE", "DEBUG"]:
+                    if valid in intent:
+                        return valid
+        except Exception as e:
+            print(f"  [DEBUG] Intent LLM error: {e}")
+        
+        # If it genuinely fails, a safe backup strategy is to look for core action words in the string yourself
+        query_upper = query.upper()
+        if any(w in query_upper for w in ["WRITE", "CREATE", "GENERATE", "MODIFY", "CHANGE"]):
+            return "GENERATE"
+        if any(w in query_upper for w in ["EXPLAIN", "WHAT DOES", "HOW DOES", "UNDERSTAND"]):
+            return "EXPLAIN"
+            
+        return "GENERATE"
+
+    def ask(
+        self,
+        user_query: str,
+        top_k: int = 5,
+        classification: Optional[str] = None,
+        capability: Optional[str] = None,
+        llm_model: str = "qwen2.5-coder:14b",
+        intent_model: str = "qwen2.5:3b",
+        temperature: float = 0.1,
+        max_tokens: int = 1500,
+        stream: bool = False,
+    ) -> Dict:
+        # Step 1: Detect intent
+        intent = self.detect_intent(user_query, intent_model)
+        
+        # Dynamic top_k adjustment: cast a wider net if comparing code structures
+        actual_top_k = 6 if intent == "ANALYZE" else top_k
+
+        # Step 2: Search
+        results = self.pipeline.indexer.search(
+            query=user_query, top_k=actual_top_k,
+            classification=classification, capability=capability,
+        )
+        
+        # Step 3: Build context (Passing the intent variable here!)
+        context = self._build_context(results, user_query, intent=intent)
+        
+        # Step 4: Build prompt
+        prompt = self.PROMPTS[intent].format(context=context, query=user_query)
+        
+        # Step 5: Call Ollama
+        gen_temp = 0.3 if intent == "GENERATE" else temperature
+        
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": llm_model,
+                "prompt": prompt,
+                "stream": stream,
+                "options": {"temperature": gen_temp, "num_predict": max_tokens},
+            },
+            timeout=300
+        )
+        
+        answer = ""
+        if response.status_code == 200:
+            if stream:
+                answer = response.text
+            else:
+                answer = response.json().get("response", "")
+        
+        return {
+            "intent": intent,
+            "answer": answer,
+            "prompt": prompt,
+            "procedures_retrieved": [r["id"] for r in results[:actual_top_k]],
+            "scores": [round(r["score"], 3) for r in results[:actual_top_k]],
+            "model": llm_model,
+        }
+
+    def ask_streaming(self, user_query: str, top_k: int = 5,
+                      classification: Optional[str] = None,
+                      capability: Optional[str] = None,
+                      llm_model: str = "qwen2.5-coder:14b",
+                      intent_model: str = "qwen2.5:3b"):
+        intent = self.detect_intent(user_query, intent_model)
+        
+        # Dynamic top_k adjustment for streaming mode as well
+        actual_top_k = 6 if intent == "ANALYZE" else top_k
+
+        results = self.pipeline.indexer.search(
+            query=user_query, top_k=actual_top_k,
+            classification=classification, capability=capability,
+        )
+        
+        # Passing the intent variable here too!
+        context = self._build_context(results, user_query, intent=intent)
+        prompt = self.PROMPTS[intent].format(context=context, query=user_query)
+        
+        gen_temp = 0.3 if intent == "GENERATE" else 0.1
+        
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": llm_model,
+                "prompt": prompt,
+                "stream": True,
+                "options": {"temperature": gen_temp},
+            },
+            stream=True,
+            timeout=300
+        )
+        
+        for line in response.iter_lines():
+            if line:
+                data = json.loads(line)
+                yield data.get("response", "")
+
+    def _build_context(self, results: List[Dict], query: str, intent: str = "EXPLAIN") -> str:
+        parts = []
+        total_chars = 0
+        
+        # 1. If analyzing/comparing, read deeper into top_k (up to 6) instead of choking at 3
+        max_chunks = 6 if intent == "ANALYZE" else 3
+        # 2. If comparing, restrict sections per file to save space so they all fit
+        max_sections_per_chunk = 2 if intent == "ANALYZE" else 4
+        
+        for chunk in results[:max_chunks]:
+            filtered = self.pipeline.selector.select(chunk, query, max_sections=max_sections_per_chunk)
+            if not filtered["selected_sections"]:
+                continue
+            
+            chunk_text = self._format_chunk(filtered)
+            
+            # Expanded character window slightly to accommodate multiple files
+            if total_chars + len(chunk_text) > 12000:
+                break
+            
+            parts.append(chunk_text)
+            total_chars += len(chunk_text)
+        
+        return "\n\n".join(parts) if parts else "[No relevant procedures found.]"
+
+    def _format_chunk(self, filtered: Dict) -> str:
+        lines = []
+        metadata = filtered.get("metadata", {})
+        
+        lines.append(f"PROCEDURE: {filtered['id']}")
+        lines.append(f"TYPE: {metadata.get('classification', '')}")
+        lines.append(f"CAPABILITY: {metadata.get('capability', '')}")
+        lines.append(f"STAGE: {metadata.get('stage', '')}")
+        
+        if filtered.get("summary"):
+            lines.append(f"SUMMARY: {filtered['summary']}")
+        
+        lines.append(f"SECTIONS INCLUDED: {', '.join(filtered['selected_sections'])}")
+        lines.append("")
+        
+        for stype in filtered["selected_sections"]:
+            section = filtered["sections"].get(stype, {})
+            if not section:
+                continue
+            sql = section.get("sqlText", "")
+            if len(sql) > 2500:
+                sql = sql[:2500] + "\n-- [truncated]"
+            lines.append(f"-- [{stype}] {section.get('purpose', '')}")
+            lines.append(sql)
+            lines.append("")
+        
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# USAGE
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    indexer = SqlChunkIndexer(collection_name="hrms_procedures")
-    indexer.create_collection()
-    indexer.index_chunks(r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\t-sql\shared_data\semantic_chunks.json")
-    
-    # Initialize smart selector with the same model
-    selector = SmartSectionSelector(model=indexer.model)
-    validator = SectionValidator(max_tokens_per_section=1500)
-    
-    # ── Example 1: "How do I add a new employee?" ─────────────
-    query1 = "How do I hire a new employee with validation?"
-    results = indexer.search(query=query1, top_k=3, classification="BUSINESS_OPERATION")
-    
-    for r in results:
-        print(f"\n{'='*60}")
-        print(f"Procedure: {r['id']} (score: {r['score']:.3f})")
-        
-        # Smart selection based on query
-        filtered = selector.select(r, query=query1, max_sections=5)
-        
-        print(f"Section scores: {filtered['section_scores']}")
-        print(f"Selected: {filtered['selected_sections']}")
-        
-        validated = validator.validate(filtered, intent="auto")
-        context = validator.to_llm_context(validated)
-        print(context[:800])
-    
-    # ── Example 2: "What validations exist?" ──────────────────
-    query2 = "What business rules validate employee data before insertion?"
-    results = indexer.search(query=query2, top_k=3, traits=["VALIDATED"])
-    
-    for r in results:
-        filtered = selector.select(r, query=query2, max_sections=3)
-        print(f"\n{r['id']}: scores={filtered['section_scores']}")
-        print(f"  Selected: {filtered['selected_sections']}")
-    
-    # ── Example 3: "How is payroll calculated?" ───────────────
-    query3 = "How is payroll calculated and processed in batches?"
-    results = indexer.search(query=query3, top_k=3)
-    
-    for r in results:
-        filtered = selector.select(r, query=query3, max_sections=5)
-        print(f"\n{r['id']} (score: {r['score']:.3f})")
-        print(f"  All scores: {filtered['all_scores']}")
-        print(f"  Selected: {filtered['selected_sections']}")
+    pipeline = SqlRagPipeline(
+        collection_name="hrms_procedures",
+        max_context_tokens=3000,
+    )
+
+    # ── Index (run once) ──────────────────────────────────────
+    pipeline.index(r"C:\Users\Erwin\Desktop\rag_system\codebase_rag\t-sql\shared_data\semantic_chunks.json")
+
+    generator = AnswerGenerator(pipeline)
+
+    # ── Interactive mode ──────────────────────────────────────
+    print("\n" + "="*60)
+    print("  SQL RAG ASSISTANT")
+    print("  Type 'quit' to exit, 'stream' for streaming mode")
+    print("="*60)
+
+    while True:
+        query = input("\nYou: ").strip()
+        if not query:
+            continue
+        if query.lower() == 'quit':
+            break
+
+        if query.lower().startswith("stream "):
+            query = query[7:]
+            print(f"\n[Streaming] ", end="", flush=True)
+            for token in generator.ask_streaming(query, top_k=6):
+                print(token, end="", flush=True)
+            print()
+        else:
+            result = generator.ask(query, top_k=6)
+            print(f"\n[Intent: {result['intent']}]")
+            print(f"[Procedures: {result['procedures_retrieved']}]")
+            print(f"[Scores: {result['scores']}]")
+            print(f"\n{result['answer']}")
